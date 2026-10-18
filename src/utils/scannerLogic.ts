@@ -338,7 +338,7 @@ export function normalizeIllumination(
   if (s <= 0 || width < 2 || height < 2) return;
 
   // Cells must be wider than a pen stroke or the "background" becomes ink.
-  const cell = Math.max(8, Math.round(Math.min(width, height) / 36));
+  const cell = Math.max(8, Math.round(Math.min(width, height) / 64));
   const gw = Math.ceil(width / cell);
   const gh = Math.ceil(height / cell);
   const grid = new Float32Array(gw * gh * 3);
@@ -377,7 +377,7 @@ export function normalizeIllumination(
   // Cells covered entirely by a dark drawing would read as dark paper; a max
   // filter over neighbours followed by a blur keeps the estimate smooth.
   const spread = maxFilterGrid(grid, gw, gh, 1);
-  const smooth = blurGrid(blurGrid(spread, gw, gh), gw, gh);
+  const smooth = blurGrid(spread, gw, gh);
 
   for (let y = 0; y < height; y++) {
     const gyf = clamp((y + 0.5) / cell - 0.5, 0, gh - 1);

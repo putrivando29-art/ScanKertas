@@ -14,6 +14,9 @@ import {
   ChevronUp,
   Maximize2,
   Wand2,
+  ChevronLeft,
+  ChevronRight,
+  Trash2,
 } from 'lucide-react';
 import {
   ScannedPage,
@@ -31,6 +34,8 @@ interface EnhanceEditorViewProps {
   activePageIndex: number;
   onSelectPageIndex: (idx: number) => void;
   onUpdatePage: (updatedPage: ScannedPage) => void;
+  onReorderPage: (fromIndex: number, toIndex: number) => void;
+  onDeletePage: (pageId: string) => void;
   onAddFromCamera: () => void;
   onAddFromGallery: () => void;
   onProceedToPdf: () => void;
@@ -41,6 +46,8 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
   activePageIndex,
   onSelectPageIndex,
   onUpdatePage,
+  onReorderPage,
+  onDeletePage,
   onAddFromCamera,
   onAddFromGallery,
   onProceedToPdf,
@@ -58,6 +65,10 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
   const [draftParams, setDraftParams] = useState<ScanEnhancementParams | null>(null);
   const sliderTimerRef = useRef<number | null>(null);
   const requestIdRef = useRef<number>(0);
+  const [applyToAll, setApplyToAll] = useState<boolean>(true);
+  const [batchProgress, setBatchProgress] = useState<{ done: number; total: number } | null>(
+    null
+  );
 
   useEffect(() => {
     return () => {
@@ -75,6 +86,8 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
   if (!currentPage) {
     return null;
   }
+
+  const sliderParams = draftParams ?? currentPage.params;
 
   const applyNewParams = async (
     nextParams: ScanEnhancementParams,
@@ -105,23 +118,76 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
     }
   };
 
-  const scheduleParams = (nextParams: ScanEnhancementParams) => {
+  /**
+   * Applies a change to how the scan looks (filter, sliders, original photo).
+   * With "semua halaman" on, every page gets it, current page first so the
+   * preview updates quickly; rotation and corners always stay per page.
+   */
+  const applyLook = async (look: Partial<ScanEnhancementParams>) => {
+    const targets = applyToAll && pages.length > 1 ? pages : [currentPage];
+    if (targets.length === 1) {
+      await applyNewParams({ ...currentPage.params, ...look });
+      return;
+    }
+    const ordered = [currentPage, ...targets.filter((p) => p.id !== currentPage.id)];
+    const requestId = ++requestIdRef.current;
+    setIsReprocessing(true);
+    setBatchProgress({ done: 0, total: ordered.length });
+    try {
+      for (let i = 0; i < ordered.length; i++) {
+        const page = ordered[i];
+        const params = { ...page.params, ...look };
+        const result = await processDocumentImage(page.originalDataUrl, page.corners, params);
+        if (requestId !== requestIdRef.current) return;
+        if (i === 0) setDraftParams(null);
+        onUpdatePage({
+          ...page,
+          params,
+          processedDataUrl: result.processedDataUrl,
+          width: result.width,
+          height: result.height,
+          quality: result.quality,
+        });
+        setBatchProgress({ done: i + 1, total: ordered.length });
+      }
+    } finally {
+      if (requestId === requestIdRef.current) {
+        setIsReprocessing(false);
+        setBatchProgress(null);
+      }
+    }
+  };
+
+  const scheduleLook = (key: 'brightness' | 'contrast' | 'sharpness' | 'shadowRemoval', value: number) => {
+    const nextParams = { ...sliderParams, [key]: value };
     setDraftParams(nextParams);
     if (sliderTimerRef.current) window.clearTimeout(sliderTimerRef.current);
     sliderTimerRef.current = window.setTimeout(() => {
       sliderTimerRef.current = null;
-      applyNewParams(nextParams);
+      applyLook({
+        brightness: nextParams.brightness,
+        contrast: nextParams.contrast,
+        sharpness: nextParams.sharpness,
+        shadowRemoval: nextParams.shadowRemoval,
+      });
     }, 300);
   };
 
-  const sliderParams = draftParams ?? currentPage.params;
+  const movePage = (delta: number) => {
+    const to = activePageIndex + delta;
+    if (to < 0 || to >= pages.length) return;
+    onReorderPage(activePageIndex, to);
+    onSelectPageIndex(to);
+  };
+
+  const deleteCurrentPage = () => {
+    if (!window.confirm(`Hapus halaman ${activePageIndex + 1}?`)) return;
+    onDeletePage(currentPage.id);
+  };
+
 
   const handleFilterChange = (filter: ScanFilterMode) => {
-    applyNewParams({
-      ...currentPage.params,
-      filter,
-      keepOriginal: false,
-    });
+    applyLook({ filter, keepOriginal: false });
   };
 
   const handleRotate = (deltaDeg: number) => {
@@ -133,7 +199,15 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
   };
 
   const handleResetEnhancements = () => {
-    applyNewParams({ ...DEFAULT_ENHANCEMENT_PARAMS }, currentPage.corners);
+    const d = DEFAULT_ENHANCEMENT_PARAMS;
+    applyLook({
+      filter: d.filter,
+      brightness: d.brightness,
+      contrast: d.contrast,
+      sharpness: d.sharpness,
+      shadowRemoval: d.shadowRemoval,
+      keepOriginal: d.keepOriginal,
+    });
   };
 
   const handleSaveManualCorners = () => {
@@ -205,26 +279,71 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
         </div>
       </div>
 
-      {/* Multi-Page Selector Strip */}
+      {/* Page strip: pick a page, move it, or delete it */}
       {pages.length > 1 && (
-        <div className="flex items-center gap-2 overflow-x-auto pb-1">
-          {pages.map((p, idx) => {
-            const isCurrent = idx === activePageIndex;
-            return (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => onSelectPageIndex(idx)}
-                className={`min-h-[40px] px-3 py-1.5 rounded-xl border flex items-center gap-2 text-xs font-semibold shrink-0 ${
-                  isCurrent
-                    ? 'bg-teal-600 text-white border-teal-600'
-                    : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-800'
-                }`}
-              >
-                <span>Hal {idx + 1}</span>
-              </button>
-            );
-          })}
+        <div className="space-y-2">
+          <div className="flex items-center gap-2 overflow-x-auto pb-1">
+            {pages.map((p, idx) => {
+              const isCurrent = idx === activePageIndex;
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => onSelectPageIndex(idx)}
+                  aria-label={`Halaman ${idx + 1}`}
+                  aria-current={isCurrent}
+                  className={`relative shrink-0 w-14 h-[72px] rounded-lg overflow-hidden border-2 bg-white ${
+                    isCurrent ? 'border-teal-600' : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <img
+                    src={p.processedDataUrl}
+                    alt=""
+                    className="w-full h-full object-cover"
+                  />
+                  <span
+                    className={`absolute bottom-0 inset-x-0 text-[11px] font-bold text-center ${
+                      isCurrent ? 'bg-teal-600 text-white' : 'bg-slate-900/70 text-white'
+                    }`}
+                  >
+                    {idx + 1}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => movePage(-1)}
+              disabled={activePageIndex === 0}
+              className="min-h-[40px] px-3 py-1.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-1 disabled:opacity-40"
+            >
+              <ChevronLeft className="w-4 h-4 shrink-0" />
+              <span>Geser</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => movePage(1)}
+              disabled={activePageIndex === pages.length - 1}
+              className="min-h-[40px] px-3 py-1.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold flex items-center gap-1 disabled:opacity-40"
+            >
+              <span>Geser</span>
+              <ChevronRight className="w-4 h-4 shrink-0" />
+            </button>
+            <span className="text-[11px] text-slate-500 dark:text-slate-400 flex-1 min-w-0 truncate">
+              Pindahkan halaman {activePageIndex + 1}
+            </span>
+            <button
+              type="button"
+              onClick={deleteCurrentPage}
+              aria-label={`Hapus halaman ${activePageIndex + 1}`}
+              className="min-h-[40px] px-3 py-1.5 rounded-xl bg-white dark:bg-slate-900 border border-red-200 dark:border-red-900 text-red-600 dark:text-red-400 text-xs font-semibold flex items-center gap-1"
+            >
+              <Trash2 className="w-4 h-4 shrink-0" />
+              <span>Hapus</span>
+            </button>
+          </div>
         </div>
       )}
 
@@ -272,7 +391,11 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
           </div>
 
           <span className="text-[11px] font-mono tabular-nums text-slate-400 shrink-0">
-            {isReprocessing ? 'Memproses...' : `${currentPage.width}×${currentPage.height}`}
+            {batchProgress
+              ? `Memproses ${batchProgress.done}/${batchProgress.total}`
+              : isReprocessing
+                ? 'Memproses...'
+                : `${currentPage.width}×${currentPage.height}`}
           </span>
         </div>
 
@@ -387,12 +510,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
           </h2>
           <button
             type="button"
-            onClick={() =>
-              applyNewParams({
-                ...currentPage.params,
-                keepOriginal: !currentPage.params.keepOriginal,
-              })
-            }
+            onClick={() => applyLook({ keepOriginal: !currentPage.params.keepOriginal })}
             className={`min-h-[34px] px-2.5 py-1 rounded-lg text-xs font-semibold border transition-colors ${
               currentPage.params.keepOriginal
                 ? 'bg-amber-500 text-slate-950 border-amber-500'
@@ -402,6 +520,18 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
             {currentPage.params.keepOriginal ? 'Foto Asli: Aktif' : 'Gunakan Foto Asli'}
           </button>
         </div>
+
+        {pages.length > 1 && (
+          <label className="flex items-center gap-2 text-xs font-medium text-slate-700 dark:text-slate-300 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={applyToAll}
+              onChange={(e) => setApplyToAll(e.target.checked)}
+              className="w-4 h-4 accent-teal-600"
+            />
+            <span>Terapkan filter &amp; pengaturan ke semua {pages.length} halaman</span>
+          </label>
+        )}
 
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           {filterButtons.map((fb) => {
@@ -498,10 +628,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                   max={100}
                   value={sliderParams.shadowRemoval}
                   onChange={(e) =>
-                    scheduleParams({
-                      ...sliderParams,
-                      shadowRemoval: Number(e.target.value),
-                    })
+                    scheduleLook('shadowRemoval', Number(e.target.value))
                   }
                   className="w-full accent-teal-600"
                 />
@@ -523,10 +650,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                   max={100}
                   value={sliderParams.sharpness}
                   onChange={(e) =>
-                    scheduleParams({
-                      ...sliderParams,
-                      sharpness: Number(e.target.value),
-                    })
+                    scheduleLook('sharpness', Number(e.target.value))
                   }
                   className="w-full accent-teal-600"
                 />
@@ -549,10 +673,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                     max={50}
                     value={sliderParams.brightness}
                     onChange={(e) =>
-                      scheduleParams({
-                        ...sliderParams,
-                        brightness: Number(e.target.value),
-                      })
+                      scheduleLook('brightness', Number(e.target.value))
                     }
                     className="w-full accent-teal-600"
                   />
@@ -574,10 +695,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                     max={50}
                     value={sliderParams.contrast}
                     onChange={(e) =>
-                      scheduleParams({
-                        ...sliderParams,
-                        contrast: Number(e.target.value),
-                      })
+                      scheduleLook('contrast', Number(e.target.value))
                     }
                     className="w-full accent-teal-600"
                   />

@@ -126,7 +126,8 @@ test('perspectiveMapQuad hits the corners and keeps straight lines straight', ()
 function renderSyntheticPhoto(
   w: number,
   h: number,
-  quad: { x: number; y: number }[] | null
+  quad: { x: number; y: number }[] | null,
+  options: { paleTouch?: boolean; tintedShadow?: boolean } = {}
 ): Uint8ClampedArray {
   const px = new Uint8ClampedArray(w * h * 4);
   const inside = (x: number, y: number) => {
@@ -151,13 +152,25 @@ function renderSyntheticPhoto(
       let r = checker ? 70 : 200;
       let g = checker ? 150 : 90;
       let b = checker ? 80 : 140;
+      // A pale, cream patch of cloth touching the sheet's top-left corner.
+      if (options.paleTouch && Math.hypot(x - w * 0.12, y - h * 0.1) < w * 0.16) {
+        r = 228;
+        g = 222;
+        b = 205;
+      }
       if (inside(x, y)) {
-        const shade = x > w * 0.55 && y > h * 0.5 ? 0.72 : 1; // a hand shadow
+        const shaded = x > w * 0.45 && y > h * 0.55; // a hand shadow
         const ink = y % 16 < 2 && x % 40 < 28;
-        const v = (ink ? 60 : 225) * shade;
+        const v = ink ? 60 : 225;
         r = v;
         g = v - 3;
         b = v - 6;
+        if (shaded) {
+          // Light bounced off pink cloth tints the shadow.
+          r *= options.tintedShadow ? 0.74 : 0.72;
+          g *= options.tintedShadow ? 0.58 : 0.72;
+          b *= options.tintedShadow ? 0.64 : 0.72;
+        }
       }
       px[i] = r;
       px[i + 1] = g;
@@ -183,6 +196,25 @@ test('detectDocumentCorners finds a tilted, partly shadowed sheet on patterned c
   got.forEach((p, i) => {
     const err = Math.hypot(p.x * w - quad[i].x, p.y * h - quad[i].y);
     assert.ok(err < 10, `corner ${i} off by ${err.toFixed(1)}px`);
+  });
+});
+
+test('detectDocumentCorners keeps a tinted shadow and ignores pale cloth touching the sheet', () => {
+  const w = 400;
+  const h = 520;
+  const quad = [
+    { x: 70, y: 60 },
+    { x: 330, y: 70 },
+    { x: 338, y: 470 },
+    { x: 62, y: 462 },
+  ];
+  const photo = renderSyntheticPhoto(w, h, quad, { paleTouch: true, tintedShadow: true });
+  const found = detectDocumentCorners(photo, w, h);
+  assert.ok(found, 'paper not detected');
+  const got = [found.topLeft, found.topRight, found.bottomRight, found.bottomLeft];
+  got.forEach((p, i) => {
+    const err = Math.hypot(p.x * w - quad[i].x, p.y * h - quad[i].y);
+    assert.ok(err < 12, `corner ${i} off by ${err.toFixed(1)}px`);
   });
 });
 
