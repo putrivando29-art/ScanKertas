@@ -33,7 +33,9 @@ interface CameraScannerViewProps {
   onCancel: () => void;
 }
 
-const LIVE_DETECT_INTERVAL_MS = 350;
+const LIVE_DETECT_INTERVAL_MS = 300;
+// Smaller than the capture-time detection: fast enough to run several times a second.
+const LIVE_DETECT_SIDE = 220;
 
 type TorchCapabilities = MediaTrackCapabilities & { torch?: boolean };
 
@@ -144,12 +146,27 @@ export const CameraScannerView: React.FC<CameraScannerViewProps> = ({
       setLiveQuad(null);
       return;
     }
-    const id = window.setInterval(() => {
+    let timer = 0;
+    let stopped = false;
+    const tick = () => {
+      if (stopped) return;
       const video = videoRef.current;
-      if (!video || video.readyState < 2 || !video.videoWidth) return;
-      setLiveQuad(detectCornersInSource(video, video.videoWidth, video.videoHeight));
-    }, LIVE_DETECT_INTERVAL_MS);
-    return () => window.clearInterval(id);
+      let elapsed = 0;
+      if (video && video.readyState >= 2 && video.videoWidth) {
+        const started = performance.now();
+        setLiveQuad(
+          detectCornersInSource(video, video.videoWidth, video.videoHeight, LIVE_DETECT_SIDE)
+        );
+        elapsed = performance.now() - started;
+      }
+      // Slow phones get a longer pause so the preview and buttons stay responsive.
+      timer = window.setTimeout(tick, Math.max(LIVE_DETECT_INTERVAL_MS, elapsed * 3));
+    };
+    timer = window.setTimeout(tick, LIVE_DETECT_INTERVAL_MS);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
   }, [useLiveWebcam, step, autoDetect]);
 
   const handleToggleFlash = async () => {

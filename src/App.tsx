@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Camera,
   Image as ImageIcon,
@@ -12,6 +12,7 @@ import {
   Eye,
   Edit3,
   Smartphone,
+  Plus,
 } from 'lucide-react';
 import {
   ScannedPage,
@@ -23,6 +24,7 @@ import {
   PdfQualityOption,
   DEFAULT_SETTINGS,
   DEFAULT_ENHANCEMENT_PARAMS,
+  FULL_FRAME_CORNERS,
   formatDefaultFileName,
 } from './utils/scannerLogic.ts';
 import {
@@ -30,17 +32,17 @@ import {
   generateInitialSavedDocuments,
   SAMPLE_GALLERY_TEMPLATES,
   renderSampleDocumentPhoto,
+  loadPhotoFile,
 } from './utils/canvasProcessor.ts';
 import { generateMultiPagePdf } from './utils/pdfGenerator.ts';
 import { CameraScannerView } from './components/CameraScannerView.tsx';
-import { GalleryImportView, GalleryBatchItem } from './components/GalleryImportView.tsx';
 import { EnhanceEditorView } from './components/EnhanceEditorView.tsx';
 import { PdfComposerView } from './components/PdfComposerView.tsx';
 import { MyDocumentsView } from './components/MyDocumentsView.tsx';
 import { SettingsView } from './components/SettingsView.tsx';
 import { OfflineIndicator, ApkGuideModal, usePWAInstall } from './components/PWAInstallSection.tsx';
 
-export type ActiveTab = 'beranda' | 'kamera' | 'galeri' | 'rapikan' | 'pdf' | 'dokumen' | 'pengaturan';
+export type ActiveTab = 'beranda' | 'kamera' | 'rapikan' | 'pdf' | 'dokumen' | 'pengaturan';
 
 const STORAGE_KEY_DOCS = 'scankertas_saved_docs_v1';
 const STORAGE_KEY_SETTINGS = 'scankertas_settings_v1';
@@ -156,6 +158,13 @@ export default function App() {
     }
   }, [settings]);
 
+  // Deleting the last page leaves nothing to edit.
+  useEffect(() => {
+    if (activePages.length === 0 && (activeTab === 'rapikan' || activeTab === 'pdf')) {
+      setActiveTab('beranda');
+    }
+  }, [activePages.length, activeTab]);
+
   // Reset scroll to top on view navigation
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: 'instant' });
@@ -231,37 +240,51 @@ export default function App() {
     setActiveTab('rapikan');
   };
 
-  const handleGalleryImportBatch = async (
-    items: GalleryBatchItem[],
-    options: {
-      autoCrop: boolean;
-      keepOriginal: boolean;
-      filter: ScanFilterMode;
-    }
-  ) => {
+  const galleryInputRef = useRef<HTMLInputElement | null>(null);
+  const [importProgress, setImportProgress] = useState<{ done: number; total: number } | null>(
+    null
+  );
+
+  // Opened straight from the tap so the browser treats it as a user action.
+  const openGalleryPicker = () => galleryInputRef.current?.click();
+
+  const handleGalleryFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = '';
+    if (files.length === 0) return;
+
+    const filter: ScanFilterMode = settings.autoWhiteBackground ? 'putih_bersih' : 'warna_asli';
     const createdPages: ScannedPage[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      const params = {
-        ...DEFAULT_ENHANCEMENT_PARAMS,
-        filter: options.filter,
-        autoCrop: options.autoCrop,
-        keepOriginal: options.keepOriginal,
-      };
-      const proc = await processDocumentImage(item.rawDataUrl, item.corners, params);
-      createdPages.push({
-        id: `page-${Date.now()}-${i}`,
-        label: item.title,
-        originalDataUrl: item.rawDataUrl,
-        processedDataUrl: proc.processedDataUrl,
-        corners: item.corners,
-        params,
-        quality: proc.quality,
-        width: proc.width,
-        height: proc.height,
-        createdAt: new Date().toISOString(),
-      });
+    setImportProgress({ done: 0, total: files.length });
+    try {
+      for (let i = 0; i < files.length; i++) {
+        try {
+          const photo = await loadPhotoFile(files[i]);
+          // No sheet found: keep the whole photo; it may already be a clean scan.
+          const corners = settings.autoDetectEdges && photo.corners ? photo.corners : FULL_FRAME_CORNERS;
+          const params = { ...DEFAULT_ENHANCEMENT_PARAMS, filter, autoCrop: true, keepOriginal: false };
+          const proc = await processDocumentImage(photo.dataUrl, corners, params);
+          createdPages.push({
+            id: `page-${Date.now()}-${i}`,
+            label: `Halaman ${activePages.length + createdPages.length + 1}`,
+            originalDataUrl: photo.dataUrl,
+            processedDataUrl: proc.processedDataUrl,
+            corners,
+            params,
+            quality: proc.quality,
+            width: proc.width,
+            height: proc.height,
+            createdAt: new Date().toISOString(),
+          });
+        } catch {
+          // An unreadable file is skipped; the rest still import.
+        }
+        setImportProgress({ done: i + 1, total: files.length });
+      }
+    } finally {
+      setImportProgress(null);
     }
+    if (createdPages.length === 0) return;
 
     const nextPages = [...activePages, ...createdPages];
     setActivePages(nextPages);
@@ -446,12 +469,8 @@ export default function App() {
           </button>
           <button
             type="button"
-            onClick={() => setActiveTab('galeri')}
-            className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 py-1 ${
-              activeTab === 'galeri'
-                ? 'text-teal-600 dark:text-teal-400 font-bold underline underline-offset-8 decoration-2'
-                : ''
-            }`}
+            onClick={openGalleryPicker}
+            className="hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 py-1"
           >
             Import Galeri
           </button>
@@ -484,9 +503,16 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab('kamera')}
-            className="min-h-[40px] px-3.5 py-2 text-xs font-bold text-white bg-teal-600 rounded-xl hover:bg-teal-500 transition-colors whitespace-nowrap shrink-0"
+            className="min-h-[40px] px-3.5 py-2 text-xs font-bold text-white bg-teal-600 rounded-xl hover:bg-teal-500 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5"
           >
-            Mulai Pindai
+            {activePages.length > 0 ? (
+              <>
+                <Plus className="w-4 h-4 shrink-0" />
+                <span>Foto Lagi</span>
+              </>
+            ) : (
+              <span>Mulai Pindai</span>
+            )}
           </button>
         </div>
       </header>
@@ -581,7 +607,7 @@ export default function App() {
                   <div className="grid grid-cols-2 gap-2.5">
                     <button
                       type="button"
-                      onClick={() => setActiveTab('galeri')}
+                      onClick={openGalleryPicker}
                       className="min-h-[48px] px-3 py-2.5 rounded-xl bg-slate-900 dark:bg-slate-800 hover:bg-slate-800 text-white font-bold text-xs sm:text-sm flex items-center justify-center gap-2 truncate"
                     >
                       <ImageIcon className="w-4 h-4 text-teal-400 shrink-0" />
@@ -786,25 +812,16 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'galeri' && (
-          <GalleryImportView
-            defaultAutoCrop={settings.autoDetectEdges}
-            defaultFilter={settings.autoWhiteBackground ? 'putih_bersih' : 'warna_asli'}
-            onImportBatch={handleGalleryImportBatch}
-            onCancel={() =>
-              setActiveTab(activePages.length > 0 ? 'rapikan' : 'beranda')
-            }
-          />
-        )}
-
         {activeTab === 'rapikan' && (
           <EnhanceEditorView
             pages={activePages}
             activePageIndex={activePageIndex}
             onSelectPageIndex={setActivePageIndex}
             onUpdatePage={handleUpdateActivePage}
+            onReorderPage={handleReorderPage}
+            onDeletePage={handleDeleteActivePage}
             onAddFromCamera={() => setActiveTab('kamera')}
-            onAddFromGallery={() => setActiveTab('galeri')}
+            onAddFromGallery={openGalleryPicker}
             onProceedToPdf={() => setActiveTab('pdf')}
           />
         )}
@@ -827,7 +844,7 @@ export default function App() {
               setActiveTab('rapikan');
             }}
             onAddFromCamera={() => setActiveTab('kamera')}
-            onAddFromGallery={() => setActiveTab('galeri')}
+            onAddFromGallery={openGalleryPicker}
             onSaveDocumentComplete={handleSaveDocumentComplete}
             onBackToEditor={() =>
               setActiveTab(activePages.length > 0 ? 'rapikan' : 'beranda')
@@ -906,12 +923,8 @@ export default function App() {
 
         <button
           type="button"
-          onClick={() => setActiveTab('galeri')}
-          className={`h-full flex flex-col items-center justify-center min-w-0 ${
-            activeTab === 'galeri'
-              ? 'text-teal-600 dark:text-teal-400 font-bold'
-              : 'text-slate-500 dark:text-slate-400'
-          }`}
+          onClick={openGalleryPicker}
+          className="h-full flex flex-col items-center justify-center min-w-0 text-slate-500 dark:text-slate-400"
         >
           <ImageIcon className="w-5 h-5 shrink-0" />
           <span className="text-[10px] mt-0.5 truncate max-w-full px-1">Galeri</span>
@@ -943,6 +956,27 @@ export default function App() {
           <span className="text-[10px] mt-0.5 truncate max-w-full px-1">Pengaturan</span>
         </button>
       </nav>
+
+      <input
+        ref={galleryInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        onChange={handleGalleryFiles}
+        className="hidden"
+      />
+
+      {importProgress && (
+        <div className="fixed inset-0 z-50 bg-slate-950/70 flex items-center justify-center p-6">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl px-6 py-5 text-center shadow-xl">
+            <div className="w-8 h-8 mx-auto mb-3 rounded-full border-4 border-teal-600 border-t-transparent animate-spin" />
+            <p className="text-sm font-semibold text-slate-900 dark:text-white">
+              Memproses foto {Math.min(importProgress.done + 1, importProgress.total)} dari{' '}
+              {importProgress.total}
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

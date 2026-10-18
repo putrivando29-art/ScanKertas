@@ -670,6 +670,35 @@ export async function processDocumentImage(
 }
 
 const MAX_SOURCE_SIDE = 2600;
+
+/**
+ * Reads a photo picked from the phone, shrinks it to a size the scanner can
+ * use (12 MP originals would fill browser storage after a page or two), and
+ * finds the sheet in it. `corners` is null when no sheet was found.
+ */
+export async function loadPhotoFile(
+  file: File
+): Promise<{ dataUrl: string; corners: QuadCorners | null }> {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await loadImageElement(url);
+    const natW = img.naturalWidth || img.width;
+    const natH = img.naturalHeight || img.height;
+    const scale = Math.min(1, MAX_SOURCE_SIDE / Math.max(natW, natH));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(natW * scale));
+    canvas.height = Math.max(1, Math.round(natH * scale));
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Gagal membaca foto.');
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return {
+      dataUrl: canvas.toDataURL('image/jpeg', 0.9),
+      corners: detectCornersInSource(canvas, canvas.width, canvas.height),
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
 const MAX_OUTPUT_SIDE = 2000;
 const DETECT_SIDE = 320;
 
@@ -688,10 +717,11 @@ let detectCanvas: HTMLCanvasElement | null = null;
 export function detectCornersInSource(
   source: CanvasImageSource,
   width: number,
-  height: number
+  height: number,
+  maxSide: number = DETECT_SIDE
 ): QuadCorners | null {
   if (!width || !height) return null;
-  const scale = Math.min(1, DETECT_SIDE / Math.max(width, height));
+  const scale = Math.min(1, maxSide / Math.max(width, height));
   const w = Math.max(1, Math.round(width * scale));
   const h = Math.max(1, Math.round(height * scale));
   detectCanvas ??= document.createElement('canvas');
@@ -700,7 +730,7 @@ export function detectCornersInSource(
   const ctx = detectCanvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return null;
   ctx.drawImage(source, 0, 0, w, h);
-  return detectDocumentCorners(ctx.getImageData(0, 0, w, h).data, w, h);
+  return detectDocumentCorners(ctx.getImageData(0, 0, w, h).data, w, h, maxSide);
 }
 
 /**
