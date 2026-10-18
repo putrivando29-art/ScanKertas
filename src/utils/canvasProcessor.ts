@@ -3,13 +3,15 @@ import {
   ScanEnhancementParams,
   QualityAssessment,
   calculateOutputDimensions,
-  bilinearInterpolateQuad,
+  perspectiveMapQuad,
   applyPixelFilter,
+  normalizeIllumination,
   assessImageQuality,
   clamp,
   DEFAULT_ENHANCEMENT_PARAMS,
   SavedDocument,
 } from './scannerLogic.ts';
+import { detectDocumentCorners } from './documentDetector.ts';
 
 export interface SamplePhotoTemplate {
   id: string;
@@ -499,20 +501,22 @@ export async function processDocumentImage(
   quality: QualityAssessment;
 }> {
   const img = await loadImageElement(sourceDataUrl);
-  const srcW = img.naturalWidth || img.width || 720;
-  const srcH = img.naturalHeight || img.height || 960;
+  const natW = img.naturalWidth || img.width || 720;
+  const natH = img.naturalHeight || img.height || 960;
+  // Phone photos can be 12+ megapixels; more than this only costs time and memory.
+  const srcScale = Math.min(1, MAX_SOURCE_SIDE / Math.max(natW, natH));
+  const srcW = Math.max(1, Math.round(natW * srcScale));
+  const srcH = Math.max(1, Math.round(natH * srcScale));
 
-  // Draw source image onto an offscreen canvas to read pixels
   const srcCanvas = document.createElement('canvas');
   srcCanvas.width = srcW;
   srcCanvas.height = srcH;
-  const srcCtx = srcCanvas.getContext('2d');
+  const srcCtx = srcCanvas.getContext('2d', { willReadFrequently: true });
   if (!srcCtx) {
     throw new Error('Gagal menginisialisasi kanvas pemrosesan gambar.');
   }
   srcCtx.drawImage(img, 0, 0, srcW, srcH);
-  const srcImageData = srcCtx.getImageData(0, 0, srcW, srcH);
-  const srcPixels = srcImageData.data;
+  const srcPixels = srcCtx.getImageData(0, 0, srcW, srcH).data;
 
   // Sample luminance & edge variance for QualityAssessment
   const lumSamples: number[] = [];
@@ -522,7 +526,7 @@ export async function processDocumentImage(
   const stepX = Math.max(4, Math.floor(srcW / 32));
 
   for (let y = stepY; y < srcH - stepY; y += stepY) {
-    for (let x = stepX; x < srcXLimit(srcW, stepX); x += stepX) {
+    for (let x = stepX; x < srcW - stepX; x += stepX) {
       const idx = (y * srcW + x) * 4;
       const lum = 0.299 * srcPixels[idx] + 0.587 * srcPixels[idx + 1] + 0.114 * srcPixels[idx + 2];
       lumSamples.push(lum);
@@ -549,9 +553,7 @@ export async function processDocumentImage(
         };
 
   const dims = calculateOutputDimensions(activeCorners, srcW, srcH);
-  // Cap maximum dimension to 900px for snappy real-time performance
-  const maxDim = 860;
-  const scale = Math.min(1, maxDim / Math.max(dims.width, dims.height));
+  const scale = Math.min(1, MAX_OUTPUT_SIDE / Math.max(dims.width, dims.height));
   const targetW = Math.max(120, Math.round(dims.width * scale));
   const targetH = Math.max(160, Math.round(dims.height * scale));
 
@@ -566,28 +568,44 @@ export async function processDocumentImage(
   const outImageData = warpCtx.createImageData(targetW, targetH);
   const outPixels = outImageData.data;
 
-  // Perspective rectification + per-pixel filter in a single pass
+  // Perspective rectification with bilinear sampling, so thin strokes do not break up.
   for (let y = 0; y < targetH; y++) {
-    const v = y / (targetH - 1);
+    const v = targetH > 1 ? y / (targetH - 1) : 0;
     for (let x = 0; x < targetW; x++) {
-      const u = x / (targetW - 1);
-      const srcPt = bilinearInterpolateQuad(activeCorners, u, v);
-      const sx = clamp(Math.round(srcPt.x * (srcW - 1)), 0, srcW - 1);
-      const sy = clamp(Math.round(srcPt.y * (srcH - 1)), 0, srcH - 1);
-
-      const sIdx = (sy * srcW + sx) * 4;
-      const [r, g, b] = applyPixelFilter(
-        srcPixels[sIdx],
-        srcPixels[sIdx + 1],
-        srcPixels[sIdx + 2],
-        params
-      );
-
+      const u = targetW > 1 ? x / (targetW - 1) : 0;
+      const srcPt = perspectiveMapQuad(activeCorners, u, v);
+      const fx = clamp(srcPt.x * (srcW - 1), 0, srcW - 1);
+      const fy = clamp(srcPt.y * (srcH - 1), 0, srcH - 1);
+      const x0 = Math.floor(fx);
+      const y0 = Math.floor(fy);
+      const x1 = Math.min(srcW - 1, x0 + 1);
+      const y1 = Math.min(srcH - 1, y0 + 1);
+      const tx = fx - x0;
+      const ty = fy - y0;
+      const i00 = (y0 * srcW + x0) * 4;
+      const i10 = (y0 * srcW + x1) * 4;
+      const i01 = (y1 * srcW + x0) * 4;
+      const i11 = (y1 * srcW + x1) * 4;
       const dIdx = (y * targetW + x) * 4;
-      outPixels[dIdx] = r;
-      outPixels[dIdx + 1] = g;
-      outPixels[dIdx + 2] = b;
+      for (let c = 0; c < 3; c++) {
+        const top = srcPixels[i00 + c] * (1 - tx) + srcPixels[i10 + c] * tx;
+        const bottom = srcPixels[i01 + c] * (1 - tx) + srcPixels[i11 + c] * tx;
+        outPixels[dIdx + c] = top * (1 - ty) + bottom * ty;
+      }
       outPixels[dIdx + 3] = 255;
+    }
+  }
+
+  if (!params.keepOriginal) {
+    // "Warna Asli" keeps more of the original lighting so colours stay natural.
+    const strength = (params.shadowRemoval / 100) * (params.filter === 'warna_asli' ? 0.6 : 1);
+    normalizeIllumination(outPixels, targetW, targetH, strength);
+
+    for (let i = 0; i < outPixels.length; i += 4) {
+      const [r, g, b] = applyPixelFilter(outPixels[i], outPixels[i + 1], outPixels[i + 2], params);
+      outPixels[i] = r;
+      outPixels[i + 1] = g;
+      outPixels[i + 2] = b;
     }
   }
 
@@ -651,8 +669,38 @@ export async function processDocumentImage(
   };
 }
 
-function srcXLimit(srcW: number, stepX: number): number {
-  return srcW - stepX;
+const MAX_SOURCE_SIDE = 2600;
+const MAX_OUTPUT_SIDE = 2000;
+const DETECT_SIDE = 320;
+
+/**
+ * Detects the paper corners in an image (data URL). Returns null when no
+ * sheet is found, so the caller can ask the user to place the corners.
+ */
+export async function detectCornersInImage(src: string): Promise<QuadCorners | null> {
+  const img = await loadImageElement(src);
+  return detectCornersInSource(img, img.naturalWidth || img.width, img.naturalHeight || img.height);
+}
+
+let detectCanvas: HTMLCanvasElement | null = null;
+
+/** Same as detectCornersInImage for anything drawable, such as a live <video>. */
+export function detectCornersInSource(
+  source: CanvasImageSource,
+  width: number,
+  height: number
+): QuadCorners | null {
+  if (!width || !height) return null;
+  const scale = Math.min(1, DETECT_SIDE / Math.max(width, height));
+  const w = Math.max(1, Math.round(width * scale));
+  const h = Math.max(1, Math.round(height * scale));
+  detectCanvas ??= document.createElement('canvas');
+  detectCanvas.width = w;
+  detectCanvas.height = h;
+  const ctx = detectCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0, w, h);
+  return detectDocumentCorners(ctx.getImageData(0, 0, w, h).data, w, h);
 }
 
 /**
