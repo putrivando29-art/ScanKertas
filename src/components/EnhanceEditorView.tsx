@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   RotateCcw,
   RotateCw,
@@ -12,6 +12,8 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Maximize2,
+  Wand2,
 } from 'lucide-react';
 import {
   ScannedPage,
@@ -20,9 +22,9 @@ import {
   QuadCorners,
   DEFAULT_ENHANCEMENT_PARAMS,
   FULL_FRAME_CORNERS,
-  clamp,
 } from '../utils/scannerLogic.ts';
-import { processDocumentImage } from '../utils/canvasProcessor.ts';
+import { processDocumentImage, detectCornersInImage } from '../utils/canvasProcessor.ts';
+import { CornerEditor } from './CornerEditor.tsx';
 
 interface EnhanceEditorViewProps {
   pages: ScannedPage[];
@@ -51,10 +53,22 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
     currentPage?.corners || FULL_FRAME_CORNERS
   );
   const [isReprocessing, setIsReprocessing] = useState<boolean>(false);
+  const [detectMessage, setDetectMessage] = useState<string | null>(null);
+  // Slider positions while dragging; the image is reprocessed once the slider settles.
+  const [draftParams, setDraftParams] = useState<ScanEnhancementParams | null>(null);
+  const sliderTimerRef = useRef<number | null>(null);
+  const requestIdRef = useRef<number>(0);
+
+  useEffect(() => {
+    return () => {
+      if (sliderTimerRef.current) window.clearTimeout(sliderTimerRef.current);
+    };
+  }, []);
 
   useEffect(() => {
     if (currentPage) {
       setLocalCorners(currentPage.corners);
+      setDraftParams(null);
     }
   }, [currentPage?.id]);
 
@@ -66,6 +80,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
     nextParams: ScanEnhancementParams,
     nextCorners: QuadCorners = currentPage.corners
   ) => {
+    const requestId = ++requestIdRef.current;
     setIsReprocessing(true);
     try {
       const result = await processDocumentImage(
@@ -73,6 +88,9 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
         nextCorners,
         nextParams
       );
+      // A newer change started while this one was processing; its result wins.
+      if (requestId !== requestIdRef.current) return;
+      setDraftParams(null);
       onUpdatePage({
         ...currentPage,
         corners: nextCorners,
@@ -83,9 +101,20 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
         quality: result.quality,
       });
     } finally {
-      setIsReprocessing(false);
+      if (requestId === requestIdRef.current) setIsReprocessing(false);
     }
   };
+
+  const scheduleParams = (nextParams: ScanEnhancementParams) => {
+    setDraftParams(nextParams);
+    if (sliderTimerRef.current) window.clearTimeout(sliderTimerRef.current);
+    sliderTimerRef.current = window.setTimeout(() => {
+      sliderTimerRef.current = null;
+      applyNewParams(nextParams);
+    }, 300);
+  };
+
+  const sliderParams = draftParams ?? currentPage.params;
 
   const handleFilterChange = (filter: ScanFilterMode) => {
     applyNewParams({
@@ -119,14 +148,20 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
     );
   };
 
-  const nudgeLocalCorner = (key: keyof QuadCorners, dx: number, dy: number) => {
-    setLocalCorners((prev) => ({
-      ...prev,
-      [key]: {
-        x: Number(clamp(prev[key].x + dx, 0.02, 0.98).toFixed(3)),
-        y: Number(clamp(prev[key].y + dy, 0.02, 0.98).toFixed(3)),
-      },
-    }));
+  const startEditingCorners = () => {
+    setLocalCorners(currentPage.corners);
+    setDetectMessage(null);
+    setEditingCorners(true);
+  };
+
+  const handleRedetect = async () => {
+    const found = await detectCornersInImage(currentPage.originalDataUrl);
+    if (found) {
+      setLocalCorners(found);
+      setDetectMessage(null);
+    } else {
+      setDetectMessage('Kertas tidak terdeteksi. Geser titik sudut secara manual.');
+    }
   };
 
   const filterButtons: { id: ScanFilterMode; label: string; desc: string }[] = [
@@ -135,12 +170,6 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
     { id: 'warna_asli', label: 'Warna Asli', desc: 'Pertahankan warna stempel' },
     { id: 'abu_tajam', label: 'Abu-abu', desc: 'Skala keabuan hemat ukuran' },
   ];
-
-  const polyPoints = `${localCorners.topLeft.x * 100},${localCorners.topLeft.y * 100} ${
-    localCorners.topRight.x * 100
-  },${localCorners.topRight.y * 100} ${localCorners.bottomRight.x * 100},${
-    localCorners.bottomRight.y * 100
-  } ${localCorners.bottomLeft.x * 100},${localCorners.bottomLeft.y * 100}`;
 
   return (
     <div className="w-full max-w-4xl mx-auto px-3 sm:px-6 py-4 space-y-4">
@@ -249,73 +278,38 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
 
         {/* Canvas Preview or Corner Editor */}
         {editingCorners ? (
-          <div className="w-full max-w-[380px] mx-auto space-y-3">
-            <div className="relative w-full aspect-[3/4] rounded-xl overflow-hidden bg-slate-950 border border-slate-700">
-              <img
-                src={currentPage.originalDataUrl}
-                alt="Atur 4 Sudut Kertas"
-                referrerPolicy="no-referrer"
-                className="w-full h-full object-cover"
-              />
-              <svg
-                viewBox="0 0 100 100"
-                preserveAspectRatio="none"
-                className="absolute inset-0 w-full h-full pointer-events-none"
-              >
-                <polygon
-                  points={polyPoints}
-                  fill="rgba(20, 184, 166, 0.2)"
-                  stroke="#14b8a6"
-                  strokeWidth="1"
-                />
-              </svg>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              {(
-                [
-                  ['topLeft', 'Kiri Atas'],
-                  ['topRight', 'Kanan Atas'],
-                  ['bottomRight', 'Kanan Bawah'],
-                  ['bottomLeft', 'Kiri Bawah'],
-                ] as [keyof QuadCorners, string][]
-              ).map(([key, label]) => (
-                <div
-                  key={key}
-                  className="p-2 rounded-xl bg-slate-800 border border-slate-700 flex items-center justify-between gap-1"
+          <div className="w-full max-w-[420px] mx-auto space-y-3">
+            <CornerEditor
+              src={currentPage.originalDataUrl}
+              corners={localCorners}
+              onChange={setLocalCorners}
+              maxHeightClass="max-h-[60vh]"
+            />
+            {detectMessage && (
+              <div className="p-2.5 rounded-lg bg-amber-500/15 text-amber-200 text-xs">
+                {detectMessage}
+              </div>
+            )}
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-slate-400">Seret titik sudut dengan jari</span>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleRedetect}
+                  className="min-h-[36px] px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1"
                 >
-                  <span className="text-[11px] font-medium text-slate-200 truncate">{label}</span>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => nudgeLocalCorner(key, -0.02, 0)}
-                      className="w-6 h-6 rounded bg-slate-700 text-white text-xs font-mono"
-                    >
-                      ←
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => nudgeLocalCorner(key, 0.02, 0)}
-                      className="w-6 h-6 rounded bg-slate-700 text-white text-xs font-mono"
-                    >
-                      →
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => nudgeLocalCorner(key, 0, -0.02)}
-                      className="w-6 h-6 rounded bg-slate-700 text-white text-xs font-mono"
-                    >
-                      ↑
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => nudgeLocalCorner(key, 0, 0.02)}
-                      className="w-6 h-6 rounded bg-slate-700 text-white text-xs font-mono"
-                    >
-                      ↓
-                    </button>
-                  </div>
-                </div>
-              ))}
+                  <Wand2 className="w-3.5 h-3.5" />
+                  <span>Pas Kertas</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLocalCorners(FULL_FRAME_CORNERS)}
+                  className="min-h-[36px] px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1"
+                >
+                  <Maximize2 className="w-3.5 h-3.5" />
+                  <span>Penuh</span>
+                </button>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <button
@@ -376,7 +370,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
 
           <button
             type="button"
-            onClick={() => setEditingCorners((prev) => !prev)}
+            onClick={() => (editingCorners ? setEditingCorners(false) : startEditingCorners())}
             className="min-h-[42px] px-1.5 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-teal-400 text-[11px] sm:text-xs font-semibold flex items-center justify-center gap-1 whitespace-nowrap"
           >
             <Crop className="w-3.5 h-3.5 shrink-0" />
@@ -494,7 +488,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                     Kurangi Bayangan &amp; Putihkan Kertas
                   </label>
                   <span className="font-mono tabular-nums text-slate-500">
-                    {currentPage.params.shadowRemoval}%
+                    {sliderParams.shadowRemoval}%
                   </span>
                 </div>
                 <input
@@ -502,10 +496,10 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                   type="range"
                   min={0}
                   max={100}
-                  value={currentPage.params.shadowRemoval}
+                  value={sliderParams.shadowRemoval}
                   onChange={(e) =>
-                    applyNewParams({
-                      ...currentPage.params,
+                    scheduleParams({
+                      ...sliderParams,
                       shadowRemoval: Number(e.target.value),
                     })
                   }
@@ -519,7 +513,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                     Tingkatkan Ketajaman Tulisan
                   </label>
                   <span className="font-mono tabular-nums text-slate-500">
-                    {currentPage.params.sharpness}%
+                    {sliderParams.sharpness}%
                   </span>
                 </div>
                 <input
@@ -527,10 +521,10 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                   type="range"
                   min={0}
                   max={100}
-                  value={currentPage.params.sharpness}
+                  value={sliderParams.sharpness}
                   onChange={(e) =>
-                    applyNewParams({
-                      ...currentPage.params,
+                    scheduleParams({
+                      ...sliderParams,
                       sharpness: Number(e.target.value),
                     })
                   }
@@ -545,7 +539,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                       Kecerahan
                     </label>
                     <span className="font-mono tabular-nums text-slate-500">
-                      {currentPage.params.brightness}
+                      {sliderParams.brightness}
                     </span>
                   </div>
                   <input
@@ -553,10 +547,10 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                     type="range"
                     min={-50}
                     max={50}
-                    value={currentPage.params.brightness}
+                    value={sliderParams.brightness}
                     onChange={(e) =>
-                      applyNewParams({
-                        ...currentPage.params,
+                      scheduleParams({
+                        ...sliderParams,
                         brightness: Number(e.target.value),
                       })
                     }
@@ -570,7 +564,7 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                       Kontras Teks
                     </label>
                     <span className="font-mono tabular-nums text-slate-500">
-                      {currentPage.params.contrast}
+                      {sliderParams.contrast}
                     </span>
                   </div>
                   <input
@@ -578,10 +572,10 @@ export const EnhanceEditorView: React.FC<EnhanceEditorViewProps> = ({
                     type="range"
                     min={-50}
                     max={50}
-                    value={currentPage.params.contrast}
+                    value={sliderParams.contrast}
                     onChange={(e) =>
-                      applyNewParams({
-                        ...currentPage.params,
+                      scheduleParams({
+                        ...sliderParams,
                         contrast: Number(e.target.value),
                       })
                     }

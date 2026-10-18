@@ -74,10 +74,10 @@ export interface AppSettings {
 
 export const DEFAULT_ENHANCEMENT_PARAMS: ScanEnhancementParams = {
   filter: 'putih_bersih',
-  brightness: 8,
-  contrast: 22,
-  sharpness: 45,
-  shadowRemoval: 75,
+  brightness: 0,
+  contrast: 15,
+  sharpness: 35,
+  shadowRemoval: 90,
   rotation: 0,
   straightenAngle: 0,
   autoCrop: true,
@@ -188,8 +188,57 @@ export function bilinearInterpolateQuad(corners: QuadCorners, u: number, v: numb
 }
 
 /**
- * Applies shadow reduction, brightness/contrast, and document scan filter
- * to a single RGB pixel [0..255].
+ * Maps (u, v) in the unit square to the quadrilateral with a true projective
+ * transform, so text spacing stays even when the photo was taken at an angle
+ * (bilinear interpolation bends straight lines in that case).
+ */
+export function perspectiveMapQuad(corners: QuadCorners, u: number, v: number): Point2D {
+  const { a, b, c, d, e, f, g, h } = squareToQuadCoefficients(corners);
+  const den = g * u + h * v + 1;
+  return { x: (a * u + b * v + c) / den, y: (d * u + e * v + f) / den };
+}
+
+export function squareToQuadCoefficients(corners: QuadCorners) {
+  const x0 = corners.topLeft.x;
+  const y0 = corners.topLeft.y;
+  const x1 = corners.topRight.x;
+  const y1 = corners.topRight.y;
+  const x2 = corners.bottomRight.x;
+  const y2 = corners.bottomRight.y;
+  const x3 = corners.bottomLeft.x;
+  const y3 = corners.bottomLeft.y;
+
+  const dx3 = x0 - x1 + x2 - x3;
+  const dy3 = y0 - y1 + y2 - y3;
+  if (Math.abs(dx3) < 1e-9 && Math.abs(dy3) < 1e-9) {
+    return { a: x1 - x0, b: x3 - x0, c: x0, d: y1 - y0, e: y3 - y0, f: y0, g: 0, h: 0 };
+  }
+  const dx1 = x1 - x2;
+  const dx2 = x3 - x2;
+  const dy1 = y1 - y2;
+  const dy2 = y3 - y2;
+  const den = dx1 * dy2 - dx2 * dy1;
+  const g = (dx3 * dy2 - dx2 * dy3) / den;
+  const h = (dx1 * dy3 - dx3 * dy1) / den;
+  return {
+    a: x1 - x0 + g * x1,
+    b: x3 - x0 + h * x3,
+    c: x0,
+    d: y1 - y0 + g * y1,
+    e: y3 - y0 + h * y3,
+    f: y0,
+    g,
+    h,
+  };
+}
+
+/**
+ * Applies brightness/contrast and the document scan filter to one RGB pixel.
+ *
+ * Expects a pixel whose lighting was already flattened by
+ * `normalizeIllumination`, so clean paper sits near 255 and ink keeps its
+ * darkness relative to the paper around it. `shadowRemoval` is applied there,
+ * not here.
  */
 export function applyPixelFilter(
   r: number,
@@ -205,63 +254,50 @@ export function applyPixelFilter(
   let ng = g;
   let nb = b;
 
-  // 1. Shadow removal: lift warm/gray paper background toward clean white
-  const shadowStrength = clamp(params.shadowRemoval, 0, 100) / 100;
-  const lum = 0.299 * nr + 0.587 * ng + 0.114 * nb;
-
-  if (shadowStrength > 0 && lum > 115) {
-    // Smoothly push paper background (luminance > 115) toward 255
-    const paperRatio = (lum - 115) / (255 - 115);
-    const boost = Math.pow(paperRatio, 0.85) * 75 * shadowStrength;
-    nr = nr + boost;
-    ng = ng + boost;
-    nb = nb + boost;
-  }
-
-  // 2. Brightness (-50 to +50 -> -75 to +75 offset)
+  // Brightness (-50 to +50 -> -65 to +65 offset)
   const brightnessOffset = (clamp(params.brightness, -50, 50) / 50) * 65;
   nr += brightnessOffset;
   ng += brightnessOffset;
   nb += brightnessOffset;
 
-  // 3. Contrast (-50 to +50)
+  // Contrast (-50 to +50)
   const contrastVal = clamp(params.contrast, -50, 50) * 1.8;
   const factor = (259 * (contrastVal + 255)) / (255 * (259 - contrastVal));
   nr = factor * (nr - 128) + 128;
   ng = factor * (ng - 128) + 128;
   nb = factor * (nb - 128) + 128;
 
-  const postLum = 0.299 * nr + 0.587 * ng + 0.114 * nb;
+  nr = clamp(nr, 0, 255);
+  ng = clamp(ng, 0, 255);
+  nb = clamp(nb, 0, 255);
+  const lum = 0.299 * nr + 0.587 * ng + 0.114 * nb;
 
-  // 4. Filter Mode
   switch (params.filter) {
     case 'putih_bersih': {
-      // Clean white background while retaining crisp dark text & colored ink/stamps
-      if (postLum > 168) {
-        const whiteBlend = clamp((postLum - 168) / 55, 0, 1);
-        nr = nr * (1 - whiteBlend) + 255 * whiteBlend;
-        ng = ng * (1 - whiteBlend) + 255 * whiteBlend;
-        nb = nb * (1 - whiteBlend) + 255 * whiteBlend;
-      } else if (postLum < 110) {
-        // Deepen dark text for high legibility
-        const inkFactor = 0.72;
-        nr *= inkFactor;
-        ng *= inkFactor;
-        nb *= inkFactor;
-      }
+      // Darken mid-tones so faint pen and pencil strokes stay readable, keep ink colour,
+      // then fade near-paper tones to pure white.
+      nr = 255 * Math.pow(nr / 255, INK_GAMMA);
+      ng = 255 * Math.pow(ng / 255, INK_GAMMA);
+      nb = 255 * Math.pow(nb / 255, INK_GAMMA);
+      const white = clamp((lum - PAPER_FADE_START) / (PAPER_FADE_END - PAPER_FADE_START), 0, 1);
+      nr = nr * (1 - white) + 255 * white;
+      ng = ng * (1 - white) + 255 * white;
+      nb = nb * (1 - white) + 255 * white;
       break;
     }
     case 'hitam_putih': {
-      // Soft adaptive-like B&W threshold around luminance 152 for crisp text without jagged edges
-      const bw = postLum > 158 ? 255 : postLum < 118 ? 12 : Math.round(((postLum - 118) / 40) * 243 + 12);
+      // Soft threshold: a short ramp avoids jagged stroke edges.
+      const bw =
+        lum >= 205 ? 255 : lum <= 150 ? lum * 0.25 : 37.5 + ((lum - 150) / 55) * 217.5;
       nr = bw;
       ng = bw;
       nb = bw;
       break;
     }
     case 'abu_tajam': {
-      // High-clarity grayscale
-      const gray = postLum > 195 ? 255 : postLum < 80 ? postLum * 0.65 : postLum;
+      const darkened = 255 * Math.pow(lum / 255, INK_GAMMA);
+      const white = clamp((lum - PAPER_FADE_START) / (PAPER_FADE_END - PAPER_FADE_START), 0, 1);
+      const gray = darkened * (1 - white) + 255 * white;
       nr = gray;
       ng = gray;
       nb = gray;
@@ -277,6 +313,143 @@ export function applyPixelFilter(
     clamp(Math.round(ng), 0, 255),
     clamp(Math.round(nb), 0, 255),
   ];
+}
+
+const INK_GAMMA = 2.1;
+const PAPER_FADE_START = 212;
+const PAPER_FADE_END = 238;
+
+/**
+ * Flattens uneven lighting on a document image in place.
+ *
+ * Paper is the brightest thing in any small neighbourhood, so a grid of local
+ * maxima (smoothed) estimates how lit the paper is everywhere, per channel.
+ * Dividing by that estimate turns shadows and tinted light into even white
+ * while ink stays as dark, relative to its surroundings, as it was. `strength`
+ * in [0, 1] blends between the original and the flattened pixel.
+ */
+export function normalizeIllumination(
+  pixels: Uint8ClampedArray,
+  width: number,
+  height: number,
+  strength: number
+): void {
+  const s = clamp(strength, 0, 1);
+  if (s <= 0 || width < 2 || height < 2) return;
+
+  // Cells must be wider than a pen stroke or the "background" becomes ink.
+  const cell = Math.max(8, Math.round(Math.min(width, height) / 36));
+  const gw = Math.ceil(width / cell);
+  const gh = Math.ceil(height / cell);
+  const grid = new Float32Array(gw * gh * 3);
+
+  for (let gy = 0; gy < gh; gy++) {
+    for (let gx = 0; gx < gw; gx++) {
+      const x0 = gx * cell;
+      const y0 = gy * cell;
+      const x1 = Math.min(width, x0 + cell);
+      const y1 = Math.min(height, y0 + cell);
+      // A high percentile rather than the max, so one specular pixel cannot win.
+      const hist = [new Uint32Array(256), new Uint32Array(256), new Uint32Array(256)];
+      let count = 0;
+      for (let y = y0; y < y1; y += 2) {
+        for (let x = x0; x < x1; x += 2) {
+          const i = (y * width + x) * 4;
+          hist[0][pixels[i]]++;
+          hist[1][pixels[i + 1]]++;
+          hist[2][pixels[i + 2]]++;
+          count++;
+        }
+      }
+      const target = Math.max(1, Math.floor(count * 0.1));
+      for (let c = 0; c < 3; c++) {
+        let acc = 0;
+        let v = 255;
+        for (; v > 0; v--) {
+          acc += hist[c][v];
+          if (acc >= target) break;
+        }
+        grid[(gy * gw + gx) * 3 + c] = v;
+      }
+    }
+  }
+
+  // Cells covered entirely by a dark drawing would read as dark paper; a max
+  // filter over neighbours followed by a blur keeps the estimate smooth.
+  const spread = maxFilterGrid(grid, gw, gh, 1);
+  const smooth = blurGrid(blurGrid(spread, gw, gh), gw, gh);
+
+  for (let y = 0; y < height; y++) {
+    const gyf = clamp((y + 0.5) / cell - 0.5, 0, gh - 1);
+    const gy0 = Math.floor(gyf);
+    const gy1 = Math.min(gh - 1, gy0 + 1);
+    const ty = gyf - gy0;
+    for (let x = 0; x < width; x++) {
+      const gxf = clamp((x + 0.5) / cell - 0.5, 0, gw - 1);
+      const gx0 = Math.floor(gxf);
+      const gx1 = Math.min(gw - 1, gx0 + 1);
+      const tx = gxf - gx0;
+      const i = (y * width + x) * 4;
+      for (let c = 0; c < 3; c++) {
+        const a = smooth[(gy0 * gw + gx0) * 3 + c];
+        const b = smooth[(gy0 * gw + gx1) * 3 + c];
+        const d = smooth[(gy1 * gw + gx0) * 3 + c];
+        const e = smooth[(gy1 * gw + gx1) * 3 + c];
+        const bg = (a * (1 - tx) + b * tx) * (1 - ty) + (d * (1 - tx) + e * tx) * ty;
+        const v = pixels[i + c];
+        const flat = Math.min(255, (v * 255) / Math.max(bg, 24));
+        pixels[i + c] = v * (1 - s) + flat * s;
+      }
+    }
+  }
+}
+
+function maxFilterGrid(grid: Float32Array, gw: number, gh: number, r: number): Float32Array {
+  const out = new Float32Array(grid.length);
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      for (let c = 0; c < 3; c++) {
+        let m = 0;
+        for (let dy = -r; dy <= r; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= gh) continue;
+          for (let dx = -r; dx <= r; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= gw) continue;
+            m = Math.max(m, grid[(yy * gw + xx) * 3 + c]);
+          }
+        }
+        // Only lift cells that are much darker than their neighbours (likely ink).
+        const own = grid[(y * gw + x) * 3 + c];
+        out[(y * gw + x) * 3 + c] = own < m * 0.75 ? m * 0.9 : own;
+      }
+    }
+  }
+  return out;
+}
+
+function blurGrid(grid: Float32Array, gw: number, gh: number): Float32Array {
+  const out = new Float32Array(grid.length);
+  for (let y = 0; y < gh; y++) {
+    for (let x = 0; x < gw; x++) {
+      for (let c = 0; c < 3; c++) {
+        let sum = 0;
+        let n = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < 0 || yy >= gh) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if (xx < 0 || xx >= gw) continue;
+            sum += grid[(yy * gw + xx) * 3 + c];
+            n++;
+          }
+        }
+        out[(y * gw + x) * 3 + c] = sum / n;
+      }
+    }
+  }
+  return out;
 }
 
 /**

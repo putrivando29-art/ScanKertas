@@ -15,6 +15,8 @@ import {
 import {
   SAMPLE_GALLERY_TEMPLATES,
   renderSampleDocumentPhoto,
+  loadImageElement,
+  detectCornersInSource,
 } from '../utils/canvasProcessor.ts';
 
 export interface GalleryBatchItem {
@@ -23,6 +25,9 @@ export interface GalleryBatchItem {
   category: string;
   rawDataUrl: string;
   corners: QuadCorners;
+  width: number;
+  height: number;
+  paperFound?: boolean;
 }
 
 interface GalleryImportViewProps {
@@ -61,6 +66,8 @@ export const GalleryImportView: React.FC<GalleryImportViewProps> = ({
       category: tpl.category,
       rawDataUrl: renderSampleDocumentPhoto(tpl, false),
       corners: tpl.defaultCorners,
+      width: 720,
+      height: 960,
     }));
     setGalleryItems(generated);
   }, []);
@@ -85,19 +92,33 @@ export const GalleryImportView: React.FC<GalleryImportViewProps> = ({
 
     Array.from(files).forEach((file, index) => {
       const reader = new FileReader();
-      reader.onload = () => {
-        if (typeof reader.result === 'string') {
-          const newId = `upload-${Date.now()}-${index}`;
-          const newItem: GalleryBatchItem = {
-            id: newId,
-            title: file.name.replace(/\.[^/.]+$/, '') || `Foto Galeri ${index + 1}`,
-            category: 'Foto Perangkat',
-            rawDataUrl: reader.result,
-            corners: DEFAULT_CORNERS,
-          };
-          setGalleryItems((prev) => [newItem, ...prev]);
-          setSelectedIds((prev) => [...prev, newId]);
+      reader.onload = async () => {
+        if (typeof reader.result !== 'string') return;
+        const dataUrl = reader.result;
+        let width = 3;
+        let height = 4;
+        let found: QuadCorners | null = null;
+        try {
+          const img = await loadImageElement(dataUrl);
+          width = img.naturalWidth || width;
+          height = img.naturalHeight || height;
+          found = detectCornersInSource(img, width, height);
+        } catch {
+          // Unreadable image: keep it in the list with default corners.
         }
+        const newId = `upload-${Date.now()}-${index}`;
+        const newItem: GalleryBatchItem = {
+          id: newId,
+          title: file.name.replace(/\.[^/.]+$/, '') || `Foto Galeri ${index + 1}`,
+          category: found ? 'Kertas terdeteksi' : 'Kertas tidak terdeteksi, atur sudut nanti',
+          rawDataUrl: dataUrl,
+          corners: found ?? DEFAULT_CORNERS,
+          width,
+          height,
+          paperFound: Boolean(found),
+        };
+        setGalleryItems((prev) => [newItem, ...prev]);
+        setSelectedIds((prev) => [...prev, newId]);
       };
       reader.readAsDataURL(file);
     });
@@ -267,12 +288,21 @@ export const GalleryImportView: React.FC<GalleryImportViewProps> = ({
                     : 'border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/40'
                 }`}
               >
-                <div className="relative w-full aspect-[3/4] bg-slate-900 overflow-hidden">
+                <div className="relative w-full aspect-[3/4] bg-slate-900 overflow-hidden flex items-center justify-center">
+                  {/* Sized to the photo's own aspect ratio so the corner outline lines up. */}
+                  <div
+                    className="relative"
+                    style={
+                      item.width / item.height > 3 / 4
+                        ? { width: '100%', aspectRatio: `${item.width} / ${item.height}` }
+                        : { height: '100%', aspectRatio: `${item.width} / ${item.height}` }
+                    }
+                  >
                   <img
                     src={item.rawDataUrl}
                     alt={item.title}
                     referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover"
+                    className="w-full h-full"
                   />
                   {autoCrop && !keepOriginal && (
                     <svg
@@ -288,6 +318,7 @@ export const GalleryImportView: React.FC<GalleryImportViewProps> = ({
                       />
                     </svg>
                   )}
+                  </div>
 
                   <div className="absolute top-2 right-2">
                     {isSelected ? (
