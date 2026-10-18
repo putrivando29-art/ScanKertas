@@ -29,7 +29,6 @@ import {
 } from './utils/scannerLogic.ts';
 import {
   processDocumentImage,
-  generateInitialSavedDocuments,
   SAMPLE_GALLERY_TEMPLATES,
   renderSampleDocumentPhoto,
   loadPhotoFile,
@@ -43,6 +42,15 @@ import { SettingsView } from './components/SettingsView.tsx';
 import { OfflineIndicator, ApkGuideModal, usePWAInstall } from './components/PWAInstallSection.tsx';
 
 export type ActiveTab = 'beranda' | 'kamera' | 'rapikan' | 'pdf' | 'dokumen' | 'pengaturan';
+
+interface NavState {
+  i: number;
+  tab: ActiveTab;
+  page: number;
+  /** Set by the camera while its corner-adjust step is showing. */
+  cam?: 'confirm';
+  guard?: boolean;
+}
 
 const STORAGE_KEY_DOCS = 'scankertas_saved_docs_v1';
 const STORAGE_KEY_SETTINGS = 'scankertas_settings_v1';
@@ -117,20 +125,19 @@ export default function App() {
         const rawSaved = localStorage.getItem(STORAGE_KEY_DOCS);
         if (rawSaved) {
           const parsedSaved = JSON.parse(rawSaved);
-          if (Array.isArray(parsedSaved) && parsedSaved.length > 0 && mounted) {
-            setSavedDocuments(parsedSaved);
-            setIsInitializing(false);
-            return;
-          }
-        }
-
-        const seeded = await generateInitialSavedDocuments();
-        if (mounted) {
-          setSavedDocuments(seeded);
-          try {
-            localStorage.setItem(STORAGE_KEY_DOCS, JSON.stringify(seeded));
-          } catch {
-            // ignore quota
+          if (Array.isArray(parsedSaved) && mounted) {
+            // Earlier versions stored made-up sample documents; drop them.
+            const realDocs = parsedSaved.filter(
+              (d: SavedDocument) => !String(d.id).startsWith('doc-seed-')
+            );
+            setSavedDocuments(realDocs);
+            if (realDocs.length !== parsedSaved.length) {
+              try {
+                localStorage.setItem(STORAGE_KEY_DOCS, JSON.stringify(realDocs));
+              } catch {
+                // ignore quota
+              }
+            }
           }
         }
       } finally {
@@ -157,6 +164,85 @@ export default function App() {
       // ignore
     }
   }, [settings]);
+
+  // Android back button: every screen change becomes a browser history entry,
+  // and going back restores the previous screen instead of leaving the app.
+  const pendingNavRef = useRef<{ tab: ActiveTab; page: number } | null>(null);
+  const cameraEntryRef = useRef<{ i: number; hadPages: boolean } | null>(null);
+  const [showExitHint, setShowExitHint] = useState<boolean>(false);
+  const pageCountRef = useRef<number>(0);
+  pageCountRef.current = activePages.length;
+
+  useEffect(() => {
+    // A guard entry under the first screen: backing onto it shows a hint
+    // instead of closing the app, and a second back then leaves.
+    window.history.replaceState({ i: 0, tab: 'beranda', page: 0, guard: true } satisfies NavState, '');
+    window.history.pushState({ i: 1, tab: 'beranda', page: 0 } satisfies NavState, '');
+    let hintTimer = 0;
+    const onPop = (e: PopStateEvent) => {
+      const st = e.state as NavState | null;
+      if (!st) return;
+      const pending = pendingNavRef.current;
+      if (pending) {
+        // Arrived where a finished capture rewound to; add the new screen on top.
+        pendingNavRef.current = null;
+        window.history.pushState({ i: st.i + 1, ...pending } satisfies NavState, '');
+        return;
+      }
+      if (st.guard) {
+        setShowExitHint(true);
+        window.clearTimeout(hintTimer);
+        hintTimer = window.setTimeout(() => setShowExitHint(false), 2500);
+      }
+      if (st.tab === 'kamera') {
+        cameraEntryRef.current = { i: st.i, hadPages: pageCountRef.current > 0 };
+      }
+      setActiveTab(st.tab);
+      setActivePageIndex(st.page);
+    };
+    window.addEventListener('popstate', onPop);
+    return () => {
+      window.removeEventListener('popstate', onPop);
+      window.clearTimeout(hintTimer);
+    };
+  }, []);
+
+  const navPage = activeTab === 'rapikan' ? activePageIndex : 0;
+  useEffect(() => {
+    if (pendingNavRef.current) return;
+    const st = window.history.state as NavState | null;
+    if (st && !st.guard && st.tab === activeTab && st.page === navPage) return;
+    const next: NavState = { i: (st?.i ?? 0) + 1, tab: activeTab, page: navPage };
+    window.history.pushState(next, '');
+    if (activeTab === 'kamera') {
+      cameraEntryRef.current = { i: next.i, hadPages: activePages.length > 0 };
+    }
+  }, [activeTab, navPage]);
+
+  /**
+   * After a capture, drop the camera screens from history so that back goes
+   * from page 2 to page 1, and from page 1 to the camera, as the user expects.
+   */
+  const showNewPage = (pageIndex: number) => {
+    const cam = cameraEntryRef.current;
+    const current = (window.history.state as NavState | null)?.i ?? 0;
+    if (cam && activeTab === 'kamera') {
+      const target = Math.max(1, cam.hadPages ? cam.i - 1 : cam.i);
+      const steps = current - target;
+      if (steps > 0) {
+        pendingNavRef.current = { tab: 'rapikan', page: pageIndex };
+        window.history.go(-steps);
+      }
+    }
+    setActivePageIndex(pageIndex);
+    setActiveTab('rapikan');
+  };
+
+  const goBack = (fallback: ActiveTab) => {
+    const st = window.history.state as NavState | null;
+    if (st && st.i > 1) window.history.back();
+    else setActiveTab(fallback);
+  };
 
   // Deleting the last page leaves nothing to edit.
   useEffect(() => {
@@ -231,13 +317,12 @@ export default function App() {
 
     const nextPages = [...activePages, newPage];
     setActivePages(nextPages);
-    setActivePageIndex(nextPages.length - 1);
     if (activePages.length === 0) {
       setActiveDocName(formatDefaultFileName(settings.defaultFilePrefix));
       setActivePaperSize(settings.defaultPaperSize);
       setActivePdfQuality(settings.defaultPdfResolution);
     }
-    setActiveTab('rapikan');
+    showNewPage(nextPages.length - 1);
   };
 
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
@@ -359,31 +444,8 @@ export default function App() {
     }
   };
 
-  const handleStartFreshPdf = async () => {
-    if (activePages.length > 0) {
-      setActiveTab('pdf');
-      return;
-    }
-    const tpl = SAMPLE_GALLERY_TEMPLATES[0];
-    const raw = renderSampleDocumentPhoto(tpl, false);
-    const proc = await processDocumentImage(raw, tpl.defaultCorners, DEFAULT_ENHANCEMENT_PARAMS);
-    const initialPage: ScannedPage = {
-      id: `page-${Date.now()}`,
-      label: tpl.title,
-      originalDataUrl: raw,
-      processedDataUrl: proc.processedDataUrl,
-      corners: tpl.defaultCorners,
-      params: { ...DEFAULT_ENHANCEMENT_PARAMS },
-      quality: proc.quality,
-      width: proc.width,
-      height: proc.height,
-      createdAt: new Date().toISOString(),
-    };
-    setActivePages([initialPage]);
-    setActivePageIndex(0);
-    setActiveDocName(formatDefaultFileName(settings.defaultFilePrefix));
-    setEditingSavedDocId(null);
-    setActiveTab('pdf');
+  const handleStartFreshPdf = () => {
+    setActiveTab(activePages.length > 0 ? 'pdf' : 'kamera');
   };
 
   const handleReEditSavedDoc = (doc: SavedDocument) => {
@@ -806,9 +868,7 @@ export default function App() {
           <CameraScannerView
             autoDetectEnabled={settings.autoDetectEdges}
             onCaptureConfirmed={handleCameraCaptureConfirmed}
-            onCancel={() =>
-              setActiveTab(activePages.length > 0 ? 'rapikan' : 'beranda')
-            }
+            onCancel={() => goBack(activePages.length > 0 ? 'rapikan' : 'beranda')}
           />
         )}
 
@@ -846,9 +906,7 @@ export default function App() {
             onAddFromCamera={() => setActiveTab('kamera')}
             onAddFromGallery={openGalleryPicker}
             onSaveDocumentComplete={handleSaveDocumentComplete}
-            onBackToEditor={() =>
-              setActiveTab(activePages.length > 0 ? 'rapikan' : 'beranda')
-            }
+            onBackToEditor={() => goBack(activePages.length > 0 ? 'rapikan' : 'beranda')}
           />
         )}
 
@@ -878,10 +936,7 @@ export default function App() {
             settings={settings}
             savedCount={savedDocuments.length}
             onUpdateSettings={setSettings}
-            onResetAllData={async () => {
-              const seeded = await generateInitialSavedDocuments();
-              persistSavedDocs(seeded);
-            }}
+            onResetAllData={() => persistSavedDocs([])}
             onOpenApkGuide={() => setShowApkGuideModal(true)}
           />
         )}
@@ -965,6 +1020,15 @@ export default function App() {
         onChange={handleGalleryFiles}
         className="hidden"
       />
+
+      {showExitHint && (
+        <div
+          role="status"
+          className="fixed left-1/2 -translate-x-1/2 bottom-20 z-50 px-4 py-2.5 rounded-xl bg-slate-900 text-white text-xs font-semibold shadow-lg"
+        >
+          Tekan Kembali sekali lagi untuk keluar
+        </div>
+      )}
 
       {importProgress && (
         <div className="fixed inset-0 z-50 bg-slate-950/70 flex items-center justify-center p-6">

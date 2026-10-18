@@ -184,6 +184,11 @@ export const CameraScannerView: React.FC<CameraScannerViewProps> = ({
   };
 
   const enterConfirm = (dataUrl: string, found: QuadCorners | null) => {
+    // Its own history entry, so the phone's back button returns to the viewfinder.
+    const st = window.history.state;
+    if (st && st.cam !== 'confirm') {
+      window.history.pushState({ ...st, i: st.i + 1, cam: 'confirm' }, '');
+    }
     setCapturedDataUrl(dataUrl);
     setDetectedCorners(found);
     setPaperFound(autoDetect ? Boolean(found) : null);
@@ -218,11 +223,31 @@ export const CameraScannerView: React.FC<CameraScannerViewProps> = ({
     }
   };
 
-  const handleRetake = () => {
+  const resetToViewfinder = useCallback(() => {
     setStep('viewfinder');
     setCapturedDataUrl('');
     setPaperFound(null);
+  }, []);
+
+  const handleRetake = () => {
+    // Going back pops the confirm entry; the popstate listener resets the view.
+    if (window.history.state?.cam === 'confirm') window.history.back();
+    else resetToViewfinder();
   };
+
+  useEffect(() => {
+    // Opened again via back/forward onto a stale confirm entry: there is no photo.
+    const st = window.history.state;
+    if (st?.cam === 'confirm') {
+      const { cam: _cam, ...rest } = st;
+      window.history.replaceState(rest, '');
+    }
+    const onPop = (e: PopStateEvent) => {
+      if (e.state?.cam !== 'confirm') resetToViewfinder();
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, [resetToViewfinder]);
 
   const handleConfirmPhoto = () => {
     const ordered = orderQuadCorners([
