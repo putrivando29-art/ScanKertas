@@ -1,0 +1,9 @@
+{
+  "appId": "id.scankertas.app",
+  "appName": "ScanKertas",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}

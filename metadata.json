@@ -1,0 +1,6 @@
+{
+  "name": "ScanKertas — Pemindai Dokumen & Pembuat PDF",
+  "description": "Aplikasi pemindai dokumen untuk mengubah foto kertas menjadi hasil scan putih bersih dengan deteksi tepi otomatis, koreksi perspektif, dan ekspor PDF.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
