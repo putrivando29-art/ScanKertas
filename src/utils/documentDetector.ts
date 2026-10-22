@@ -32,21 +32,48 @@ export function detectDocumentCorners(
   // Larger openings cut wider bridges where the sheet touches pale background,
   // at the cost of rounding the corners; the refinement step restores those.
   const base = Math.max(1, Math.round(Math.min(w, h) / 120));
-  let best: Candidate | null = null;
+  const candidates: Point2D[][] = [];
   for (const score of maps) {
     for (const radius of [base, base * 3, base * 6]) {
       const candidate = detectWithScore(score, w, h, radius);
-      if (!candidate) continue;
-      candidate.quality = edgeSupport(candidate.quad, maps, w, h);
-      if (!best || candidate.quality > best.quality) best = candidate;
+      if (candidate) candidates.push(candidate.quad);
     }
   }
-  for (const quad of houghQuads(maps, w, h)) {
-    const quality = edgeSupport(quad, maps, w, h);
-    if (!best || quality > best.quality) best = { quad, quality };
+  candidates.push(...houghQuads(maps, w, h));
+
+  // Two passes. The colour maps are strict and reliable when the background
+  // has any colour, so a confident colour answer wins. Only when they cannot
+  // see the sheet (white paper on white or cream tiles) does the looser
+  // whiteness map decide.
+  const colourMaps = maps.slice(1);
+  let best = pickBest(candidates, (quad, stride) => edgeSupport(quad, colourMaps, w, h, false, stride));
+  if (!best || best.quality < COLOUR_TRUST) {
+    const white = pickBest(candidates, (quad, stride) => edgeSupport(quad, maps, w, h, true, stride));
+    if (white && (!best || white.quality > best.quality)) best = white;
   }
   if (!best || best.quality < MIN_EDGE_SUPPORT) return null;
   return orderQuadCorners(best.quad.map((p) => ({ x: p.x / w, y: p.y / h })));
+}
+
+/**
+ * Scores every candidate coarsely, then re-scores the most promising ones with
+ * dense sampling; scoring thousands of line combinations densely is too slow
+ * on a phone.
+ */
+function pickBest(
+  candidates: Point2D[][],
+  score: (quad: Point2D[], stride: number) => number
+): Candidate | null {
+  const coarse = candidates
+    .map((quad) => ({ quad, quality: score(quad, 6) }))
+    .sort((a, b) => b.quality - a.quality)
+    .slice(0, 40);
+  let best: Candidate | null = null;
+  for (const { quad } of coarse) {
+    const quality = score(quad, 2);
+    if (!best || quality > best.quality) best = { quad, quality };
+  }
+  return best;
 }
 
 const DETECT_MAX_SIDE = 320;
@@ -54,6 +81,7 @@ const MIN_AREA_FRACTION = 0.12;
 // A quad covering nearly the whole frame is almost always background, not a sheet.
 const MAX_AREA_FRACTION = 0.93;
 const MIN_FILL_RATIO = 0.8;
+const COLOUR_TRUST = 0.7;
 
 interface Candidate {
   quad: Point2D[];
@@ -110,26 +138,61 @@ const MIN_EDGE_SUPPORT = 0.55;
  * cloth pass, with one map calling the pink squares paper and another the
  * green ones.
  */
-function edgeSupport(quad: Point2D[], maps: Float32Array[], w: number, h: number): number {
+function edgeSupport(
+  quad: Point2D[],
+  maps: Float32Array[],
+  w: number,
+  h: number,
+  firstIsWhite: boolean,
+  stride: number
+): number {
   let best = 0;
-  for (const map of maps) best = Math.max(best, edgeSupportInMap(quad, map, w, h));
+  maps.forEach((map, m) => {
+    // White paper on white tiles differs only slightly in whiteness. That map
+    // has had thin dark marks closed away, so it is compared by band averages
+    // with a small step, and weighted down because the looser test also
+    // accepts pale cloth next to the sheet. The colour maps keep the strict
+    // whole-band test that stops thin neutral lines passing as a sheet.
+    const support =
+      firstIsWhite && m === 0
+        ? WHITE_SUPPORT_WEIGHT *
+          edgeSupportInMap(quad, map, w, h, WHITE_SUPPORT_STEP, 'mean', stride)
+        : edgeSupportInMap(quad, map, w, h, EDGE_STEP, 'band', stride);
+    best = Math.max(best, support);
+  });
   return best;
 }
 
-function edgeSupportInMap(quad: Point2D[], map: Float32Array, w: number, h: number): number {
+const WHITE_SUPPORT_STEP = 6;
+const WHITE_SUPPORT_WEIGHT = 0.88;
+
+/**
+ * Per-side share of the perimeter on a real paper edge, combined so that a
+ * quad needs all four sides: 0.6 x average side + 0.4 x weakest side.
+ */
+function edgeSupportInMap(
+  quad: Point2D[],
+  map: Float32Array,
+  w: number,
+  h: number,
+  step: number,
+  mode: 'band' | 'mean',
+  stride: number
+): number {
   const ccw = signedArea(quad) > 0 ? 1 : -1;
   const reach = Math.max(2, Math.round(Math.min(w, h) / 80));
-  let supported = 0;
-  let total = 0;
+  const sides: number[] = [];
   for (let s = 0; s < 4; s++) {
     const a = quad[s];
     const b = quad[(s + 1) % 4];
     const len = Math.hypot(b.x - a.x, b.y - a.y) || 1;
     const nx = (-(b.y - a.y) / len) * ccw;
     const ny = ((b.x - a.x) / len) * ccw;
-    // Dense sampling: sparse samples can line up with a repeating background
-    // pattern and see the same phase of it every time.
-    const samples = Math.max(12, Math.round(len / 2));
+    let supported = 0;
+    let total = 0;
+    // The final score samples densely (stride 2): sparse samples can line up
+    // with a repeating background pattern and see the same phase every time.
+    const samples = Math.max(8, Math.round(len / stride));
     for (let k = 1; k < samples; k++) {
       const t = k / samples;
       if (t < 0.05 || t > 0.95) continue;
@@ -140,18 +203,28 @@ function edgeSupportInMap(quad: Point2D[], map: Float32Array, w: number, h: numb
       const oy = py - ny * (reach + 1);
       if (ox < 0 || oy < 0 || ox > w - 1 || oy > h - 1) continue;
       total++;
-      // The whole band inside must look like paper and the whole band outside
-      // must not; averages would let a 1px neutral line pass as a sheet.
-      let insideMin = Infinity;
-      let outsideMax = -Infinity;
+      let inside = mode === 'band' ? Infinity : 0;
+      let outside = mode === 'band' ? -Infinity : 0;
       for (let o = 2; o <= reach + 1; o++) {
-        insideMin = Math.min(insideMin, sampleScore(map, w, h, px + nx * o, py + ny * o));
-        outsideMax = Math.max(outsideMax, sampleScore(map, w, h, px - nx * o, py - ny * o));
+        const vi = sampleScore(map, w, h, px + nx * o, py + ny * o);
+        const vo = sampleScore(map, w, h, px - nx * o, py - ny * o);
+        if (mode === 'band') {
+          // The whole band inside must look like paper and the whole band
+          // outside must not; averages would let a 1px neutral line pass.
+          inside = Math.min(inside, vi);
+          outside = Math.max(outside, vo);
+        } else {
+          inside += vi / reach;
+          outside += vo / reach;
+        }
       }
-      if (insideMin - outsideMax > EDGE_STEP) supported++;
+      if (inside - outside > step) supported++;
     }
+    if (total >= 4) sides.push(supported / total);
   }
-  return total >= 24 ? supported / total : 0;
+  if (sides.length < 3) return 0;
+  const mean = sides.reduce((a, b) => a + b, 0) / sides.length;
+  return 0.6 * mean + 0.4 * Math.min(...sides);
 }
 
 const EDGE_STEP = 30;
@@ -251,7 +324,47 @@ function paperScoreMaps(
   // Where two colours meet, downscaling blends them into a thin grey line that
   // looks neutral and paper-toned; a 3x3 minimum removes such lines but leaves
   // the large sheet intact.
-  return { bright, neutral: minFilter3(neutral, w, h), tone: minFilter3(tone, w, h) };
+  // Text, grout lines and marble veins are thin dark marks; a grey closing
+  // (max then min) fills them in so only the broad paper/background step stays.
+  const closeR = Math.max(2, Math.round(Math.min(w, h) / 80));
+  return {
+    bright: minFilter(maxFilter(bright, w, h, closeR), w, h, closeR),
+    neutral: minFilter3(neutral, w, h),
+    tone: minFilter3(tone, w, h),
+  };
+}
+
+function maxFilter(src: Float32Array, w: number, h: number, r: number): Float32Array {
+  return rankFilter(src, w, h, r, 1);
+}
+
+function minFilter(src: Float32Array, w: number, h: number, r: number): Float32Array {
+  return rankFilter(src, w, h, r, -1);
+}
+
+// Separable square max (sign 1) or min (sign -1) filter.
+function rankFilter(src: Float32Array, w: number, h: number, r: number, sign: 1 | -1): Float32Array {
+  const tmp = new Float32Array(src.length);
+  const out = new Float32Array(src.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let m = -Infinity;
+      for (let k = Math.max(0, x - r); k <= Math.min(w - 1, x + r); k++) {
+        m = Math.max(m, sign * src[y * w + k]);
+      }
+      tmp[y * w + x] = m;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let m = -Infinity;
+      for (let k = Math.max(0, y - r); k <= Math.min(h - 1, y + r); k++) {
+        m = Math.max(m, tmp[k * w + x]);
+      }
+      out[y * w + x] = sign * m;
+    }
+  }
+  return out;
 }
 
 function minFilter3(src: Float32Array, w: number, h: number): Float32Array {
@@ -690,47 +803,81 @@ function intersect(l1: Line, l2: Line): Point2D | null {
  * plausible combination is returned for scoring.
  */
 function houghQuads(maps: Float32Array[], w: number, h: number): Point2D[][] {
+  // Lines come from two maps, each with its own peak list so neither crowds
+  // out the other. The tone map is flat over patterned cloth, so all of its
+  // edges vote. The whiteness map separates white paper from white or cream
+  // tiles, but tiles also have grout lines and marble veins; only step edges
+  // (one side clearly whiter) vote there, not thin dark lines.
+  const toneMap = maps[maps.length - 1];
+  const whiteMap = maps[0];
+  return quadsFromPeaks(
+    [
+      houghPeaks(toneMap, w, h, HOUGH_EDGE_MIN, 0),
+      houghPeaks(whiteMap, w, h, WHITE_EDGE_MIN, WHITE_STEP_MIN),
+    ],
+    w,
+    h
+  );
+}
+
+const HOUGH_EDGE_MIN = 160;
+const HOUGH_ANGLE_SLACK = 3;
+const WHITE_EDGE_MIN = 14;
+const WHITE_STEP_MIN = 5;
+const HOUGH_THETA_BINS = 180;
+
+interface Peak {
+  t: number;
+  rho: number;
+}
+
+function houghPeaks(
+  map: Float32Array,
+  w: number,
+  h: number,
+  edgeMin: number,
+  stepMin: number
+): Peak[] {
   const diag = Math.ceil(Math.hypot(w, h));
-  const thetaBins = 180;
+  const thetaBins = HOUGH_THETA_BINS;
   const rhoBins = diag * 2 + 1;
   const acc = new Float32Array(thetaBins * rhoBins);
-  const cos = new Float32Array(thetaBins);
-  const sin = new Float32Array(thetaBins);
-  for (let t = 0; t < thetaBins; t++) {
-    cos[t] = Math.cos((t * Math.PI) / thetaBins);
-    sin[t] = Math.sin((t * Math.PI) / thetaBins);
-  }
+  const { cos, sin } = trigTables();
+  const probe = 3;
 
-  // Only the tone map votes: it is flat over patterned cloth, where the other
-  // maps are full of long, perfectly straight pattern edges that would crowd
-  // out the sheet's own sides. The blob candidates still use every map.
-  {
-    const map = maps[maps.length - 1];
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        const i = y * w + x;
-        const gx =
-          map[i - w + 1] + 2 * map[i + 1] + map[i + w + 1] - map[i - w - 1] - 2 * map[i - 1] - map[i + w - 1];
-        const gy =
-          map[i + w - 1] + 2 * map[i + w] + map[i + w + 1] - map[i - w - 1] - 2 * map[i - w] - map[i - w + 1];
-        const mag = Math.hypot(gx, gy);
-        if (mag < HOUGH_EDGE_MIN) continue;
-        // Vote only for line angles close to the gradient direction.
-        let t0 = Math.round((Math.atan2(gy, gx) * thetaBins) / Math.PI);
-        t0 = ((t0 % thetaBins) + thetaBins) % thetaBins;
-        for (let dt = -HOUGH_ANGLE_SLACK; dt <= HOUGH_ANGLE_SLACK; dt++) {
-          const t = (t0 + dt + thetaBins) % thetaBins;
-          const rho = Math.round(x * cos[t] + y * sin[t]) + diag;
-          acc[t * rhoBins + rho] += Math.min(mag, 400);
-        }
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const gx =
+        map[i - w + 1] + 2 * map[i + 1] + map[i + w + 1] - map[i - w - 1] - 2 * map[i - 1] - map[i + w - 1];
+      const gy =
+        map[i + w - 1] + 2 * map[i + w] + map[i + w + 1] - map[i - w - 1] - 2 * map[i - w] - map[i - w + 1];
+      const mag = Math.hypot(gx, gy);
+      if (mag < edgeMin) continue;
+      if (stepMin > 0) {
+        // A step edge differs a few pixels to either side; a thin line does not.
+        const ux = gx / mag;
+        const uy = gy / mag;
+        const ahead = sampleScore(map, w, h, x + ux * probe, y + uy * probe);
+        const behind = sampleScore(map, w, h, x - ux * probe, y - uy * probe);
+        if (ahead - behind < stepMin) continue;
+      }
+      // Vote only for line angles close to the gradient direction.
+      let t0 = Math.round((Math.atan2(gy, gx) * thetaBins) / Math.PI);
+      t0 = ((t0 % thetaBins) + thetaBins) % thetaBins;
+      for (let dt = -HOUGH_ANGLE_SLACK; dt <= HOUGH_ANGLE_SLACK; dt++) {
+        const t = (t0 + dt + thetaBins) % thetaBins;
+        const rho = Math.round(x * cos[t] + y * sin[t]) + diag;
+        acc[t * rhoBins + rho] += Math.min(mag, 400);
       }
     }
   }
 
   // Greedy peak picking with non-maximum suppression.
-  const peaks: { t: number; rho: number }[] = [];
+  const peaks: Peak[] = [];
   let accMax = 0;
   for (let k = 0; k < acc.length; k++) if (acc[k] > accMax) accMax = acc[k];
+  if (accMax === 0) return peaks;
   // Only bins with a meaningful share of the strongest line can become peaks.
   const order: number[] = [];
   for (let k = 0; k < acc.length; k++) if (acc[k] > accMax * 0.12) order.push(k);
@@ -738,7 +885,7 @@ function houghQuads(maps: Float32Array[], w: number, h: number): Point2D[][] {
   const suppressT = 8;
   const suppressR = Math.max(4, Math.round(Math.min(w, h) * 0.04));
   for (const k of order) {
-    if (peaks.length >= 16) break;
+    if (peaks.length >= 24) break;
     const t = Math.floor(k / rhoBins);
     const rho = (k % rhoBins) - diag;
     const near = peaks.some((p) => {
@@ -750,11 +897,32 @@ function houghQuads(maps: Float32Array[], w: number, h: number): Point2D[][] {
     });
     if (!near) peaks.push({ t, rho });
   }
+  return peaks;
+}
 
-  const toLine = (p: { t: number; rho: number }): Line => ({ nx: cos[p.t], ny: sin[p.t], c: p.rho });
-  // theta near 90 degrees means a near-horizontal line.
-  const horizontal = peaks.filter((p) => Math.abs(p.t - 90) < 40).slice(0, 6).map(toLine);
-  const vertical = peaks.filter((p) => Math.abs(p.t - 90) >= 50).slice(0, 6).map(toLine);
+let trig: { cos: Float32Array; sin: Float32Array } | null = null;
+function trigTables() {
+  if (!trig) {
+    const cos = new Float32Array(HOUGH_THETA_BINS);
+    const sin = new Float32Array(HOUGH_THETA_BINS);
+    for (let t = 0; t < HOUGH_THETA_BINS; t++) {
+      cos[t] = Math.cos((t * Math.PI) / HOUGH_THETA_BINS);
+      sin[t] = Math.sin((t * Math.PI) / HOUGH_THETA_BINS);
+    }
+    trig = { cos, sin };
+  }
+  return trig;
+}
+
+function quadsFromPeaks(sources: Peak[][], w: number, h: number): Point2D[][] {
+  const { cos, sin } = trigTables();
+  const toLine = (p: Peak): Line => ({ nx: cos[p.t], ny: sin[p.t], c: p.rho });
+  // Each map contributes its own strongest lines; theta near 90 degrees is
+  // a near-horizontal line.
+  const pick = (keep: (p: Peak) => boolean) =>
+    sources.flatMap((peaks) => peaks.filter(keep).slice(0, 8)).map(toLine);
+  const horizontal = pick((p) => Math.abs(p.t - 90) < 40);
+  const vertical = pick((p) => Math.abs(p.t - 90) >= 50);
 
   const quads: Point2D[][] = [];
   for (let a = 0; a < horizontal.length; a++) {
@@ -770,8 +938,6 @@ function houghQuads(maps: Float32Array[], w: number, h: number): Point2D[][] {
   return quads;
 }
 
-const HOUGH_EDGE_MIN = 160;
-const HOUGH_ANGLE_SLACK = 3;
 
 function quadFromLines(h1: Line, h2: Line, v1: Line, v2: Line, w: number, h: number): Point2D[] | null {
   const pts = [intersect(h1, v1), intersect(h1, v2), intersect(h2, v2), intersect(h2, v1)];

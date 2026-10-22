@@ -157,14 +157,80 @@ export function calculateOutputDimensions(
   const leftH = Math.hypot(bl.x - tl.x, bl.y - tl.y);
   const rightH = Math.hypot(br.x - tr.x, br.y - tr.y);
 
-  const width = Math.max(120, Math.round(Math.max(topW, bottomW)));
-  const height = Math.max(160, Math.round(Math.max(leftH, rightH)));
+  let width = Math.max(topW, bottomW);
+  let height = Math.max(leftH, rightH);
+  // A sheet photographed at an angle looks shorter in the tilted direction;
+  // use its true proportions when the perspective allows recovering them.
+  const trueRatio = estimateRectangleAspect(tl, tr, br, bl, srcWidth, srcHeight);
+  if (trueRatio) {
+    if (width / height > trueRatio) height = width / trueRatio;
+    else width = height * trueRatio;
+  }
+  width = Math.max(120, Math.round(width));
+  height = Math.max(160, Math.round(height));
 
   return {
     width,
     height,
     aspectRatio: Number((width / height).toFixed(4)),
   };
+}
+
+/**
+ * Width / height of the real rectangle behind a perspective-distorted quad,
+ * following Zhang & He, "Whiteboard scanning and image enhancement" (2007):
+ * with the principal point assumed at the image centre, the quad fixes the
+ * camera's focal length and from it the rectangle's proportions. Returns null
+ * when the view is head-on (then the measured side lengths are already
+ * right) or the result is implausible.
+ */
+const TYPICAL_FOCAL = 0.75;
+
+export function estimateRectangleAspect(
+  tl: Point2D,
+  tr: Point2D,
+  br: Point2D,
+  bl: Point2D,
+  imageWidth: number,
+  imageHeight: number
+): number | null {
+  const u0 = imageWidth / 2;
+  const v0 = imageHeight / 2;
+  const m1 = [tl.x - u0, tl.y - v0, 1];
+  const m2 = [tr.x - u0, tr.y - v0, 1];
+  const m3 = [bl.x - u0, bl.y - v0, 1];
+  const m4 = [br.x - u0, br.y - v0, 1];
+  const cross3 = (a: number[], b: number[]) => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+  const dot3 = (a: number[], b: number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+  const m1x4 = cross3(m1, m4);
+  const k2 = dot3(m1x4, m3) / dot3(cross3(m2, m4), m3);
+  const k3 = dot3(m1x4, m2) / dot3(cross3(m3, m4), m2);
+  if (!Number.isFinite(k2) || !Number.isFinite(k3)) return null;
+  const n2 = [k2 * m2[0] - m1[0], k2 * m2[1] - m1[1], k2 * m2[2] - m1[2]];
+  const n3 = [k3 * m3[0] - m1[0], k3 * m3[1] - m1[1], k3 * m3[2] - m1[2]];
+
+  // Head-on: both vanishing points at infinity, the measured sides are right.
+  if (Math.abs(n2[2]) < 1e-3 && Math.abs(n3[2]) < 1e-3) return null;
+  // With only one vanishing point (phone tilted straight forward, the common
+  // case) the focal length cannot be recovered from the quad, so a typical
+  // phone main camera is assumed: about 26 mm equivalent, 0.75 x the long side.
+  const size = Math.max(imageWidth, imageHeight);
+  let f2 = (TYPICAL_FOCAL * size) ** 2;
+  if (Math.abs(n2[2]) >= 1e-3 && Math.abs(n3[2]) >= 1e-3) {
+    const measured = -(n2[0] * n3[0] + n2[1] * n3[1]) / (n2[2] * n3[2]);
+    if (measured > (0.4 * size) ** 2 && measured < (3 * size) ** 2) f2 = measured;
+  }
+
+  const ratio = Math.sqrt(
+    (n2[0] * n2[0] + n2[1] * n2[1] + f2 * n2[2] * n2[2]) /
+      (n3[0] * n3[0] + n3[1] * n3[1] + f2 * n3[2] * n3[2])
+  );
+  return ratio > 0.2 && ratio < 5 ? ratio : null;
 }
 
 /**
