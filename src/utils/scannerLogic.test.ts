@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   orderQuadCorners,
   calculateOutputDimensions,
+  estimateRectangleAspect,
   bilinearInterpolateQuad,
   perspectiveMapQuad,
   normalizeIllumination,
@@ -41,6 +42,57 @@ test('calculateOutputDimensions computes realistic document width, height, and a
   assert.equal(dims.width, 800);
   assert.equal(dims.height, 1120);
   assert.equal(dims.aspectRatio, Number((800 / 1120).toFixed(4)));
+});
+
+/** Projects an A4 sheet (210 x 297 mm) lying on a table into a phone photo. */
+function photographA4(f: number, tiltDeg: number, turnDeg: number) {
+  const imgW = 1080;
+  const imgH = 1440;
+  const tilt = (tiltDeg * Math.PI) / 180;
+  const turn = (turnDeg * Math.PI) / 180;
+  const project = (x0: number, y0: number) => {
+    // Turn the sheet on the table, tilt the camera forward, then push away.
+    const x = x0 * Math.cos(turn) - y0 * Math.sin(turn);
+    const y = x0 * Math.sin(turn) + y0 * Math.cos(turn);
+    const yc = y * Math.cos(tilt);
+    const zc = 520 + y * Math.sin(tilt);
+    return { x: imgW / 2 + (f * (x + 15)) / zc, y: imgH / 2 + (f * yc) / zc };
+  };
+  return {
+    imgW,
+    imgH,
+    tl: project(-105, -148.5),
+    tr: project(105, -148.5),
+    br: project(105, 148.5),
+    bl: project(-105, 148.5),
+  };
+}
+
+test('estimateRectangleAspect recovers A4 proportions from a tilted photo', () => {
+  // Sheet turned on the table: two vanishing points, the focal length is measured.
+  const turned = photographA4(1400, 40, 12);
+  const r1 = estimateRectangleAspect(turned.tl, turned.tr, turned.br, turned.bl, turned.imgW, turned.imgH);
+  assert.ok(r1 && Math.abs(r1 - 210 / 297) < 0.02, `turned ratio ${r1}`);
+
+  // Phone tilted straight forward: a symmetric trapezoid, the focal length is
+  // assumed, so the answer is close rather than exact.
+  const { imgW, imgH, tl, tr, br, bl } = photographA4(1100, 40, 0);
+  const ratio = estimateRectangleAspect(tl, tr, br, bl, imgW, imgH);
+  assert.ok(ratio, 'no ratio');
+  assert.ok(Math.abs(ratio - 210 / 297) < 0.04, `ratio ${ratio}`);
+
+  // The measured side lengths alone would make the page far too short.
+  const naiveHeight = Math.max(Math.hypot(bl.x - tl.x, bl.y - tl.y), Math.hypot(br.x - tr.x, br.y - tr.y));
+  const naiveWidth = Math.max(Math.hypot(tr.x - tl.x, tr.y - tl.y), Math.hypot(br.x - bl.x, br.y - bl.y));
+  assert.ok(naiveHeight / naiveWidth < 1.25);
+
+  const norm = (p: { x: number; y: number }) => ({ x: p.x / imgW, y: p.y / imgH });
+  const dims = calculateOutputDimensions(
+    { topLeft: norm(tl), topRight: norm(tr), bottomRight: norm(br), bottomLeft: norm(bl) },
+    imgW,
+    imgH
+  );
+  assert.ok(Math.abs(dims.height / dims.width - 297 / 210) < 0.03);
 });
 
 test('bilinearInterpolateQuad maps normalized (u, v) to exact quad corners and center', () => {
@@ -210,6 +262,61 @@ test('detectDocumentCorners keeps a tinted shadow and ignores pale cloth touchin
   ];
   const photo = renderSyntheticPhoto(w, h, quad, { paleTouch: true, tintedShadow: true });
   const found = detectDocumentCorners(photo, w, h);
+  assert.ok(found, 'paper not detected');
+  const got = [found.topLeft, found.topRight, found.bottomRight, found.bottomLeft];
+  got.forEach((p, i) => {
+    const err = Math.hypot(p.x * w - quad[i].x, p.y * h - quad[i].y);
+    assert.ok(err < 12, `corner ${i} off by ${err.toFixed(1)}px`);
+  });
+});
+
+test('detectDocumentCorners finds white paper on cream tiles with grout lines', () => {
+  const w = 400;
+  const h = 520;
+  const quad = [
+    { x: 110, y: 150 },
+    { x: 300, y: 145 },
+    { x: 318, y: 430 },
+    { x: 80, y: 425 },
+  ];
+  const px = new Uint8ClampedArray(w * h * 4);
+  const inside = (x: number, y: number) => {
+    for (let i = 0; i < 4; i++) {
+      const a = quad[i];
+      const b = quad[(i + 1) % 4];
+      if ((b.x - a.x) * (y - a.y) - (b.y - a.y) * (x - a.x) < 0) return false;
+    }
+    return true;
+  };
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      // Cream tile, a little darker towards the bottom, with grout and a vein.
+      const shade = 1 - (y / h) * 0.12;
+      let r = 214 * shade;
+      let g = 202 * shade;
+      let b = 182 * shade;
+      const grout = (x + Math.round(y * 0.3)) % 140 < 3 || (y + Math.round(x * 0.1)) % 170 < 3;
+      const vein = Math.abs(y - (60 + x * 0.8 + 18 * Math.sin(x / 25))) < 1.2;
+      if (grout || vein) {
+        r *= 0.62;
+        g *= 0.62;
+        b *= 0.62;
+      }
+      if (inside(x, y)) {
+        // Paper: only slightly whiter and cooler than the tile.
+        const text = y % 14 < 2 && x % 37 < 30 && y > 175 && y < 400;
+        r = (text ? 70 : 222) * shade;
+        g = (text ? 70 : 217) * shade;
+        b = (text ? 72 : 210) * shade;
+      }
+      const i = (y * w + x) * 4;
+      px[i] = r;
+      px[i + 1] = g;
+      px[i + 2] = b;
+      px[i + 3] = 255;
+    }
+  }
+  const found = detectDocumentCorners(px, w, h);
   assert.ok(found, 'paper not detected');
   const got = [found.topLeft, found.topRight, found.bottomRight, found.bottomLeft];
   got.forEach((p, i) => {
